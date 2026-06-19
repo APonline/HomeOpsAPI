@@ -71,6 +71,123 @@ class HomeOpsWriteController extends Controller
         });
     }
 
+
+    public function updateBill(Request $request, int $billId)
+    {
+        $userId = optional($request->user())->id ?? 1;
+
+        $data = $request->validate([
+            'payee' => ['required', 'string', 'max:160'],
+            'amount' => ['nullable', 'numeric', 'min:0'],
+            'due_day' => ['nullable', 'integer', 'min:1', 'max:31'],
+            'frequency' => ['required', Rule::in(['once', 'weekly', 'biweekly', 'monthly', 'quarterly', 'semiannual', 'annual'])],
+            'notes' => ['nullable', 'string'],
+        ]);
+
+        return DB::transaction(function () use ($data, $userId, $billId) {
+            $bill = DB::table('bills')
+                ->where('user_id', $userId)
+                ->where('id', $billId)
+                ->first();
+
+            abort_if(!$bill, 404, 'Bill not found.');
+
+            $vendorId = $this->firstOrCreateVendor($userId, $data['payee'], 'payee');
+            $categoryId = $bill->category_id ?: $this->firstOrCreateCategory($userId, 'Bills', 'bill');
+
+            $monthStart = now()->startOfMonth();
+            $monthEnd = $monthStart->copy()->endOfMonth();
+            $dueDate = null;
+
+            if (!empty($data['due_day'])) {
+                $day = min((int) $data['due_day'], (int) $monthEnd->format('j'));
+                $dueDate = $monthStart->copy()->day($day)->toDateString();
+            }
+
+            DB::table('bills')
+                ->where('user_id', $userId)
+                ->where('id', $billId)
+                ->update([
+                    'vendor_id' => $vendorId,
+                    'category_id' => $categoryId,
+                    'name' => $data['payee'],
+                    'frequency' => $data['frequency'],
+                    'expected_amount' => $data['amount'] ?? null,
+                    'variable_amount' => empty($data['amount']) ? 1 : 0,
+                    'due_day' => $data['due_day'] ?? null,
+                    'next_due_date' => $dueDate,
+                    'notes' => $data['notes'] ?? null,
+                    'updated_at' => now(),
+                ]);
+
+            $instance = DB::table('bill_instances')
+                ->where('user_id', $userId)
+                ->where('bill_id', $billId)
+                ->where('period_month', $monthStart->toDateString())
+                ->first();
+
+            if ($instance && !in_array($instance->status, ['paid', 'cleared'], true)) {
+                DB::table('bill_instances')
+                    ->where('id', $instance->id)
+                    ->update([
+                        'due_date' => $dueDate,
+                        'expected_amount' => $data['amount'] ?? null,
+                        'updated_at' => now(),
+                    ]);
+            } elseif (!$instance && $dueDate) {
+                DB::table('bill_instances')->insert([
+                    'user_id' => $userId,
+                    'bill_id' => $billId,
+                    'period_month' => $monthStart->toDateString(),
+                    'due_date' => $dueDate,
+                    'expected_amount' => $data['amount'] ?? null,
+                    'status' => 'expected',
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            }
+
+            return response()->json([
+                'ok' => true,
+                'id' => $billId,
+                'message' => 'Bill updated.',
+            ]);
+        });
+    }
+
+    public function deleteBill(Request $request, int $billId)
+    {
+        $userId = optional($request->user())->id ?? 1;
+
+        return DB::transaction(function () use ($userId, $billId) {
+            $bill = DB::table('bills')
+                ->where('user_id', $userId)
+                ->where('id', $billId)
+                ->first();
+
+            abort_if(!$bill, 404, 'Bill not found.');
+
+            DB::table('bill_instances')
+                ->where('user_id', $userId)
+                ->where('bill_id', $billId)
+                ->whereNotIn('status', ['paid', 'cleared'])
+                ->delete();
+
+            DB::table('bills')
+                ->where('user_id', $userId)
+                ->where('id', $billId)
+                ->update([
+                    'status' => 'inactive',
+                    'updated_at' => now(),
+                ]);
+
+            return response()->json([
+                'ok' => true,
+                'message' => 'Bill deleted.',
+            ]);
+        });
+    }
+
     public function markBillPaid(Request $request, int $billId)
     {
         $userId = optional($request->user())->id ?? 1;

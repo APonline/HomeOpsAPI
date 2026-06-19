@@ -46,6 +46,7 @@ class HomeOpsReadController extends Controller
                     'category_name' => $bill->category_name,
                     'due' => $dueDate ? Carbon::parse($dueDate)->format('M j') : 'TBD',
                     'due_date' => $dueDate,
+                    'due_day' => $bill->due_day ? (int) $bill->due_day : null,
                     'status' => $instance ? $this->displayStatus($instance->status) : 'Due',
                     'amount' => $amount !== null ? (float) $amount : null,
                     'expected_amount' => $bill->expected_amount !== null ? (float) $bill->expected_amount : null,
