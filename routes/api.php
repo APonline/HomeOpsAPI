@@ -4,8 +4,20 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\HomeOpsDashboardController;
 use App\Http\Controllers\HomeOpsReadController;
 use App\Http\Controllers\HomeOpsWriteController;
+use App\Http\Controllers\HomeOpsHomeController;
 
 Route::prefix('homeops')->group(function () {
+    Route::get('/homes', [HomeOpsHomeController::class, 'index']);
+    Route::post('/homes', [HomeOpsHomeController::class, 'store']);
+    Route::get('/homes/{homeId}', [HomeOpsHomeController::class, 'show']);
+    Route::patch('/homes/{homeId}', [HomeOpsHomeController::class, 'update']);
+    Route::get('/homes/{homeId}/rooms', [HomeOpsHomeController::class, 'rooms']);
+    Route::post('/homes/{homeId}/rooms', [HomeOpsHomeController::class, 'storeRoom']);
+    Route::get('/homes/{homeId}/assets', [HomeOpsHomeController::class, 'assets']);
+    Route::post('/homes/{homeId}/assets', [HomeOpsHomeController::class, 'storeAsset']);
+    Route::get('/homes/{homeId}/timeline', [HomeOpsHomeController::class, 'timeline']);
+    Route::post('/homes/{homeId}/timeline', [HomeOpsHomeController::class, 'storeTimelineEvent']);
+
     Route::get('/dashboard', [HomeOpsDashboardController::class, 'index']);
 
     Route::get('/bills', [HomeOpsReadController::class, 'bills']);

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -10,23 +11,28 @@ class HomeOpsReadController extends Controller
 {
     public function bills(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
-        $monthStart = Carbon::parse($request->query('month', now()->format('Y-m-01')))->startOfMonth();
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+        $period = HomeOpsV0::period($request);
+        $monthStart = $period['month_start'];
         $monthEnd = $monthStart->copy()->endOfMonth();
 
-        $billInstances = DB::table('bill_instances')
+        $billInstancesQuery = DB::table('bill_instances')
             ->where('user_id', $userId)
-            ->where('period_month', $monthStart->toDateString())
-            ->get()
-            ->keyBy('bill_id');
+            ->where('period_month', $monthStart->toDateString());
+        HomeOpsV0::unqualifiedHomeFilter($billInstancesQuery, 'bill_instances', $homeId);
+        $billInstances = $billInstancesQuery->get()->keyBy('bill_id');
 
-        $bills = DB::table('bills')
+        $billsQuery = DB::table('bills')
             ->leftJoin('vendors', 'vendors.id', '=', 'bills.vendor_id')
             ->leftJoin('categories', 'categories.id', '=', 'bills.category_id')
             ->where('bills.user_id', $userId)
             ->where('bills.status', 'active')
             ->orderByRaw('COALESCE(bills.next_due_date, "9999-12-31")')
-            ->orderBy('bills.name')
+            ->orderBy('bills.name');
+        HomeOpsV0::homeFilter($billsQuery, 'bills', $homeId);
+
+        $bills = $billsQuery
             ->get([
                 'bills.*',
                 'vendors.name as vendor_name',
@@ -39,6 +45,7 @@ class HomeOpsReadController extends Controller
 
                 return [
                     'id' => (int) $bill->id,
+                    'home_id' => isset($bill->home_id) ? (int) $bill->home_id : null,
                     'instance_id' => $instance?->id ? (int) $instance->id : null,
                     'payee' => $bill->name,
                     'name' => $bill->name,
@@ -56,39 +63,47 @@ class HomeOpsReadController extends Controller
                 ];
             });
 
-        return response()->json(['bills' => $bills]);
+        return response()->json([
+            'home' => HomeOpsV0::homeSummary($homeId),
+            'period' => $this->periodPayload($period),
+            'bills' => $bills,
+        ]);
     }
 
     public function ledgerEntries(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
-        $monthStart = Carbon::parse($request->query('month', now()->format('Y-m-01')))->startOfMonth();
-        $monthEnd = $monthStart->copy()->endOfMonth();
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+        $period = HomeOpsV0::period($request);
 
-        $entries = DB::table('ledger_entries')
+        $entriesQuery = DB::table('ledger_entries')
             ->leftJoin('vendors', 'vendors.id', '=', 'ledger_entries.vendor_id')
             ->leftJoin('categories', 'categories.id', '=', 'ledger_entries.category_id')
             ->leftJoin('period_ledger_entries', 'period_ledger_entries.ledger_entry_id', '=', 'ledger_entries.id')
             ->leftJoin('spending_periods', 'spending_periods.id', '=', 'period_ledger_entries.spending_period_id')
             ->where('ledger_entries.user_id', $userId)
-            ->whereBetween('ledger_entries.entry_date', [$monthStart->toDateString(), $monthEnd->toDateString()])
+            ->whereBetween('ledger_entries.entry_date', [$period['date_from'], $period['date_to']])
             ->orderByDesc('ledger_entries.entry_date')
-            ->orderByDesc('ledger_entries.id')
-            ->get([
-                'ledger_entries.id',
-                'ledger_entries.entry_date',
-                'ledger_entries.title',
-                'ledger_entries.entry_type',
-                'ledger_entries.status',
-                'ledger_entries.total_amount',
-                'vendors.name as vendor_name',
-                'categories.name as category_name',
-                'spending_periods.title as period_title',
-            ]);
+            ->orderByDesc('ledger_entries.id');
+        HomeOpsV0::homeFilter($entriesQuery, 'ledger_entries', $homeId);
 
-        $periods = $this->periodsForMonth($userId, $monthStart, $monthEnd);
+        $entries = $entriesQuery->get([
+            'ledger_entries.id',
+            'ledger_entries.entry_date',
+            'ledger_entries.title',
+            'ledger_entries.entry_type',
+            'ledger_entries.status',
+            'ledger_entries.total_amount',
+            'vendors.name as vendor_name',
+            'categories.name as category_name',
+            'spending_periods.title as period_title',
+        ]);
+
+        $periods = $this->periodsForRange($userId, $homeId, $period['date_from'], $period['date_to']);
 
         return response()->json([
+            'home' => HomeOpsV0::homeSummary($homeId),
+            'period' => $this->periodPayload($period),
             'entries' => $entries,
             'periods' => $periods,
         ]);
@@ -96,69 +111,82 @@ class HomeOpsReadController extends Controller
 
     public function spendingPeriods(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
-        $monthStart = Carbon::parse($request->query('month', now()->format('Y-m-01')))->startOfMonth();
-        $monthEnd = $monthStart->copy()->endOfMonth();
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+        $period = HomeOpsV0::period($request);
 
         return response()->json([
-            'periods' => $this->periodsForMonth($userId, $monthStart, $monthEnd),
+            'home' => HomeOpsV0::homeSummary($homeId),
+            'period' => $this->periodPayload($period),
+            'periods' => $this->periodsForRange($userId, $homeId, $period['date_from'], $period['date_to']),
         ]);
     }
 
     public function maintenanceItems(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
-        $items = DB::table('maintenance_items')
+        $itemsQuery = DB::table('maintenance_items')
             ->where('user_id', $userId)
             ->where('status', 'active')
             ->orderByRaw('COALESCE(next_due_date, "9999-12-31")')
-            ->orderByRaw("FIELD(priority, 'urgent', 'high', 'normal', 'low')")
-            ->get();
+            ->orderByRaw("FIELD(priority, 'urgent', 'high', 'normal', 'low')");
+        HomeOpsV0::unqualifiedHomeFilter($itemsQuery, 'maintenance_items', $homeId);
 
-        return response()->json(['items' => $items]);
+        return response()->json([
+            'home' => HomeOpsV0::homeSummary($homeId),
+            'items' => $itemsQuery->get(),
+        ]);
     }
 
     public function wishlistItems(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
-        $items = DB::table('wishlist_items')
+        $itemsQuery = DB::table('wishlist_items')
             ->where('user_id', $userId)
             ->whereIn('status', ['idea', 'researching', 'planned'])
             ->orderByRaw("FIELD(priority, 'urgent', 'high', 'normal', 'low')")
             ->orderBy('item_type')
-            ->orderBy('title')
-            ->get();
+            ->orderBy('title');
+        HomeOpsV0::unqualifiedHomeFilter($itemsQuery, 'wishlist_items', $homeId);
 
-        return response()->json(['items' => $items]);
+        return response()->json([
+            'home' => HomeOpsV0::homeSummary($homeId),
+            'items' => $itemsQuery->get(),
+        ]);
     }
 
-    private function periodsForMonth(int $userId, Carbon $monthStart, Carbon $monthEnd)
+    private function periodsForRange(int $userId, ?int $homeId, string $dateFrom, string $dateTo)
     {
-        $periods = DB::table('spending_periods')
+        $periodsQuery = DB::table('spending_periods')
             ->where('user_id', $userId)
             ->where('active', 1)
-            ->where(function ($query) use ($monthStart, $monthEnd) {
-                $query->whereBetween('start_date', [$monthStart->toDateString(), $monthEnd->toDateString()])
-                    ->orWhereBetween('end_date', [$monthStart->toDateString(), $monthEnd->toDateString()])
-                    ->orWhere(function ($nested) use ($monthStart, $monthEnd) {
-                        $nested->where('start_date', '<=', $monthStart->toDateString())
-                            ->where('end_date', '>=', $monthEnd->toDateString());
+            ->where(function ($query) use ($dateFrom, $dateTo) {
+                $query->whereBetween('start_date', [$dateFrom, $dateTo])
+                    ->orWhereBetween('end_date', [$dateFrom, $dateTo])
+                    ->orWhere(function ($nested) use ($dateFrom, $dateTo) {
+                        $nested->where('start_date', '<=', $dateFrom)
+                            ->where('end_date', '>=', $dateTo);
                     });
             })
-            ->orderBy('start_date')
-            ->get();
+            ->orderBy('start_date');
+        HomeOpsV0::unqualifiedHomeFilter($periodsQuery, 'spending_periods', $homeId);
+        $periods = $periodsQuery->get();
 
-        return $periods->map(function ($period) use ($userId) {
+        return $periods->map(function ($period) use ($userId, $homeId) {
             $ledger = DB::table('ledger_entries')
                 ->where('user_id', $userId)
                 ->where('direction', 'out')
                 ->whereIn('status', ['paid', 'cleared'])
                 ->whereBetween('entry_date', [$period->start_date, $period->end_date]);
+            HomeOpsV0::unqualifiedHomeFilter($ledger, 'ledger_entries', $homeId);
 
             return [
                 'id' => (int) $period->id,
+                'home_id' => isset($period->home_id) ? (int) $period->home_id : null,
                 'name' => $period->title,
                 'title' => $period->title,
                 'dates' => Carbon::parse($period->start_date)->format('M j') . '–' . Carbon::parse($period->end_date)->format('M j'),
@@ -193,5 +221,17 @@ class HomeOpsReadController extends Controller
             'pending', 'expected' => 'Due',
             default => ucfirst($status),
         };
+    }
+
+    private function periodPayload(array $period): array
+    {
+        return [
+            'view_mode' => $period['view_mode'],
+            'selected_year' => $period['selected_year'],
+            'selected_month' => $period['selected_month'],
+            'selected_day' => $period['selected_day'],
+            'date_from' => $period['date_from'],
+            'date_to' => $period['date_to'],
+        ];
     }
 }

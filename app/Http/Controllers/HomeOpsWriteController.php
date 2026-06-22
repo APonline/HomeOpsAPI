@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -11,9 +12,11 @@ class HomeOpsWriteController extends Controller
 {
     public function storeBill(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
             'payee' => ['required', 'string', 'max:160'],
             'amount' => ['nullable', 'numeric', 'min:0'],
             'due_day' => ['nullable', 'integer', 'min:1', 'max:31'],
@@ -21,7 +24,7 @@ class HomeOpsWriteController extends Controller
             'notes' => ['nullable', 'string'],
         ]);
 
-        return DB::transaction(function () use ($data, $userId) {
+        return DB::transaction(function () use ($data, $userId, $homeId) {
             $vendorId = $this->firstOrCreateVendor($userId, $data['payee'], 'payee');
             $categoryId = $this->firstOrCreateCategory($userId, 'Bills', 'bill');
 
@@ -33,7 +36,7 @@ class HomeOpsWriteController extends Controller
                 $dueDate = $monthStart->copy()->day($day)->toDateString();
             }
 
-            $billId = DB::table('bills')->insertGetId([
+            $billPayload = [
                 'user_id' => $userId,
                 'vendor_id' => $vendorId,
                 'category_id' => $categoryId,
@@ -48,10 +51,13 @@ class HomeOpsWriteController extends Controller
                 'notes' => $data['notes'] ?? null,
                 'created_at' => now(),
                 'updated_at' => now(),
-            ]);
+            ];
+            $billPayload = HomeOpsV0::addHomeId($billPayload, 'bills', $homeId);
+
+            $billId = DB::table('bills')->insertGetId($billPayload);
 
             if ($dueDate) {
-                DB::table('bill_instances')->insertOrIgnore([
+                $instancePayload = [
                     'user_id' => $userId,
                     'bill_id' => $billId,
                     'period_month' => Carbon::parse($dueDate)->startOfMonth()->toDateString(),
@@ -60,7 +66,9 @@ class HomeOpsWriteController extends Controller
                     'status' => 'expected',
                     'created_at' => now(),
                     'updated_at' => now(),
-                ]);
+                ];
+                $instancePayload = HomeOpsV0::addHomeId($instancePayload, 'bill_instances', $homeId);
+                DB::table('bill_instances')->insertOrIgnore($instancePayload);
             }
 
             return response()->json([
@@ -71,12 +79,13 @@ class HomeOpsWriteController extends Controller
         });
     }
 
-
     public function updateBill(Request $request, int $billId)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
             'payee' => ['required', 'string', 'max:160'],
             'amount' => ['nullable', 'numeric', 'min:0'],
             'due_day' => ['nullable', 'integer', 'min:1', 'max:31'],
@@ -84,11 +93,12 @@ class HomeOpsWriteController extends Controller
             'notes' => ['nullable', 'string'],
         ]);
 
-        return DB::transaction(function () use ($data, $userId, $billId) {
-            $bill = DB::table('bills')
+        return DB::transaction(function () use ($data, $userId, $billId, $homeId) {
+            $billQuery = DB::table('bills')
                 ->where('user_id', $userId)
-                ->where('id', $billId)
-                ->first();
+                ->where('id', $billId);
+            HomeOpsV0::unqualifiedHomeFilter($billQuery, 'bills', $homeId);
+            $bill = $billQuery->first();
 
             abort_if(!$bill, 404, 'Bill not found.');
 
@@ -104,27 +114,31 @@ class HomeOpsWriteController extends Controller
                 $dueDate = $monthStart->copy()->day($day)->toDateString();
             }
 
+            $updatePayload = [
+                'vendor_id' => $vendorId,
+                'category_id' => $categoryId,
+                'name' => $data['payee'],
+                'frequency' => $data['frequency'],
+                'expected_amount' => $data['amount'] ?? null,
+                'variable_amount' => empty($data['amount']) ? 1 : 0,
+                'due_day' => $data['due_day'] ?? null,
+                'next_due_date' => $dueDate,
+                'notes' => $data['notes'] ?? null,
+                'updated_at' => now(),
+            ];
+            $updatePayload = HomeOpsV0::addHomeId($updatePayload, 'bills', $homeId);
+
             DB::table('bills')
                 ->where('user_id', $userId)
                 ->where('id', $billId)
-                ->update([
-                    'vendor_id' => $vendorId,
-                    'category_id' => $categoryId,
-                    'name' => $data['payee'],
-                    'frequency' => $data['frequency'],
-                    'expected_amount' => $data['amount'] ?? null,
-                    'variable_amount' => empty($data['amount']) ? 1 : 0,
-                    'due_day' => $data['due_day'] ?? null,
-                    'next_due_date' => $dueDate,
-                    'notes' => $data['notes'] ?? null,
-                    'updated_at' => now(),
-                ]);
+                ->update($updatePayload);
 
-            $instance = DB::table('bill_instances')
+            $instanceQuery = DB::table('bill_instances')
                 ->where('user_id', $userId)
                 ->where('bill_id', $billId)
-                ->where('period_month', $monthStart->toDateString())
-                ->first();
+                ->where('period_month', $monthStart->toDateString());
+            HomeOpsV0::unqualifiedHomeFilter($instanceQuery, 'bill_instances', $homeId);
+            $instance = $instanceQuery->first();
 
             if ($instance && !in_array($instance->status, ['paid', 'cleared'], true)) {
                 DB::table('bill_instances')
@@ -135,7 +149,7 @@ class HomeOpsWriteController extends Controller
                         'updated_at' => now(),
                     ]);
             } elseif (!$instance && $dueDate) {
-                DB::table('bill_instances')->insert([
+                $instancePayload = [
                     'user_id' => $userId,
                     'bill_id' => $billId,
                     'period_month' => $monthStart->toDateString(),
@@ -144,7 +158,9 @@ class HomeOpsWriteController extends Controller
                     'status' => 'expected',
                     'created_at' => now(),
                     'updated_at' => now(),
-                ]);
+                ];
+                $instancePayload = HomeOpsV0::addHomeId($instancePayload, 'bill_instances', $homeId);
+                DB::table('bill_instances')->insert($instancePayload);
             }
 
             return response()->json([
@@ -157,21 +173,24 @@ class HomeOpsWriteController extends Controller
 
     public function deleteBill(Request $request, int $billId)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
-        return DB::transaction(function () use ($userId, $billId) {
-            $bill = DB::table('bills')
+        return DB::transaction(function () use ($userId, $billId, $homeId) {
+            $billQuery = DB::table('bills')
                 ->where('user_id', $userId)
-                ->where('id', $billId)
-                ->first();
+                ->where('id', $billId);
+            HomeOpsV0::unqualifiedHomeFilter($billQuery, 'bills', $homeId);
+            $bill = $billQuery->first();
 
             abort_if(!$bill, 404, 'Bill not found.');
 
-            DB::table('bill_instances')
+            $instances = DB::table('bill_instances')
                 ->where('user_id', $userId)
                 ->where('bill_id', $billId)
-                ->whereNotIn('status', ['paid', 'cleared'])
-                ->delete();
+                ->whereNotIn('status', ['paid', 'cleared']);
+            HomeOpsV0::unqualifiedHomeFilter($instances, 'bill_instances', $homeId);
+            $instances->delete();
 
             DB::table('bills')
                 ->where('user_id', $userId)
@@ -190,9 +209,11 @@ class HomeOpsWriteController extends Controller
 
     public function markBillPaid(Request $request, int $billId)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
             'month' => ['nullable', 'date'],
             'amount' => ['nullable', 'numeric', 'min:0'],
             'paid_at' => ['nullable', 'date'],
@@ -200,11 +221,12 @@ class HomeOpsWriteController extends Controller
             'notes' => ['nullable', 'string'],
         ]);
 
-        return DB::transaction(function () use ($userId, $billId, $data) {
-            $bill = DB::table('bills')
+        return DB::transaction(function () use ($userId, $billId, $data, $homeId) {
+            $billQuery = DB::table('bills')
                 ->where('user_id', $userId)
-                ->where('id', $billId)
-                ->first();
+                ->where('id', $billId);
+            HomeOpsV0::unqualifiedHomeFilter($billQuery, 'bills', $homeId);
+            $bill = $billQuery->first();
 
             abort_if(!$bill, 404, 'Bill not found.');
 
@@ -220,10 +242,11 @@ class HomeOpsWriteController extends Controller
                 $dueDate = $monthStart->copy()->day($day)->toDateString();
             }
 
-            $existingInstance = DB::table('bill_instances')
+            $existingInstanceQuery = DB::table('bill_instances')
                 ->where('bill_id', $billId)
-                ->where('period_month', $monthStart->toDateString())
-                ->first();
+                ->where('period_month', $monthStart->toDateString());
+            HomeOpsV0::unqualifiedHomeFilter($existingInstanceQuery, 'bill_instances', $homeId);
+            $existingInstance = $existingInstanceQuery->first();
 
             if ($existingInstance) {
                 DB::table('bill_instances')
@@ -237,7 +260,7 @@ class HomeOpsWriteController extends Controller
 
                 $instanceId = $existingInstance->id;
             } else {
-                $instanceId = DB::table('bill_instances')->insertGetId([
+                $instancePayload = [
                     'user_id' => $userId,
                     'bill_id' => $billId,
                     'period_month' => $monthStart->toDateString(),
@@ -248,7 +271,9 @@ class HomeOpsWriteController extends Controller
                     'paid_at' => $paidAt,
                     'created_at' => now(),
                     'updated_at' => now(),
-                ]);
+                ];
+                $instancePayload = HomeOpsV0::addHomeId($instancePayload, 'bill_instances', $homeId);
+                $instanceId = DB::table('bill_instances')->insertGetId($instancePayload);
             }
 
             $existingLedger = DB::table('ledger_entries')
@@ -257,41 +282,36 @@ class HomeOpsWriteController extends Controller
                 ->where('entry_type', 'bill_payment')
                 ->first();
 
+            $ledgerPayload = [
+                'user_id' => $userId,
+                'vendor_id' => $bill->vendor_id,
+                'category_id' => $bill->category_id,
+                'bill_instance_id' => $instanceId,
+                'entry_type' => 'bill_payment',
+                'direction' => 'out',
+                'entry_date' => $paidAt,
+                'title' => $bill->name,
+                'total_amount' => $amount,
+                'status' => 'paid',
+                'source' => 'manual',
+                'notes' => $data['notes'] ?? 'Marked paid from HomeOps Bills page.',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+            $ledgerPayload = HomeOpsV0::addHomeId($ledgerPayload, 'ledger_entries', $homeId);
+
             if ($existingLedger) {
+                unset($ledgerPayload['user_id'], $ledgerPayload['bill_instance_id'], $ledgerPayload['entry_type'], $ledgerPayload['direction'], $ledgerPayload['source'], $ledgerPayload['created_at']);
                 DB::table('ledger_entries')
                     ->where('id', $existingLedger->id)
-                    ->update([
-                        'vendor_id' => $bill->vendor_id,
-                        'category_id' => $bill->category_id,
-                        'entry_date' => $paidAt,
-                        'title' => $bill->name,
-                        'total_amount' => $amount,
-                        'status' => 'paid',
-                        'notes' => $data['notes'] ?? 'Marked paid from HomeOps Bills page.',
-                        'updated_at' => now(),
-                    ]);
+                    ->update($ledgerPayload);
 
                 $ledgerId = $existingLedger->id;
             } else {
-                $ledgerId = DB::table('ledger_entries')->insertGetId([
-                    'user_id' => $userId,
-                    'vendor_id' => $bill->vendor_id,
-                    'category_id' => $bill->category_id,
-                    'bill_instance_id' => $instanceId,
-                    'entry_type' => 'bill_payment',
-                    'direction' => 'out',
-                    'entry_date' => $paidAt,
-                    'title' => $bill->name,
-                    'total_amount' => $amount,
-                    'status' => 'paid',
-                    'source' => 'manual',
-                    'notes' => $data['notes'] ?? 'Marked paid from HomeOps Bills page.',
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ]);
+                $ledgerId = DB::table('ledger_entries')->insertGetId($ledgerPayload);
             }
 
-            $this->autoLinkLedgerToPeriods($userId, $ledgerId, $paidAt);
+            $this->autoLinkLedgerToPeriods($userId, $homeId, $ledgerId, $paidAt);
 
             return response()->json([
                 'ok' => true,
@@ -304,9 +324,13 @@ class HomeOpsWriteController extends Controller
 
     public function storeReceipt(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
+            'room_id' => ['nullable', 'integer'],
+            'asset_id' => ['nullable', 'integer'],
             'vendor' => ['required', 'string', 'max:180'],
             'date' => ['required', 'date'],
             'total' => ['required', 'numeric', 'min:0'],
@@ -314,12 +338,12 @@ class HomeOpsWriteController extends Controller
             'notes' => ['nullable', 'string'],
         ]);
 
-        return DB::transaction(function () use ($data, $userId) {
+        return DB::transaction(function () use ($data, $userId, $homeId) {
             $categoryId = $this->firstOrCreateCategory($userId, $data['category'] ?: 'Uncategorized Spending', 'spending');
             $vendorId = $this->firstOrCreateVendor($userId, $data['vendor'], 'store', $categoryId);
             $entryDate = Carbon::parse($data['date'])->toDateString();
 
-            $ledgerId = DB::table('ledger_entries')->insertGetId([
+            $ledgerPayload = [
                 'user_id' => $userId,
                 'vendor_id' => $vendorId,
                 'category_id' => $categoryId,
@@ -333,9 +357,14 @@ class HomeOpsWriteController extends Controller
                 'notes' => $data['notes'] ?? null,
                 'created_at' => now(),
                 'updated_at' => now(),
-            ]);
+            ];
+            $ledgerPayload = HomeOpsV0::addHomeId($ledgerPayload, 'ledger_entries', $homeId);
+            $ledgerPayload = HomeOpsV0::addRoomId($ledgerPayload, 'ledger_entries', $data['room_id'] ?? null);
+            $ledgerPayload = HomeOpsV0::addAssetId($ledgerPayload, 'ledger_entries', $data['asset_id'] ?? null);
 
-            $receiptId = DB::table('receipts')->insertGetId([
+            $ledgerId = DB::table('ledger_entries')->insertGetId($ledgerPayload);
+
+            $receiptPayload = [
                 'user_id' => $userId,
                 'vendor_id' => $vendorId,
                 'ledger_entry_id' => $ledgerId,
@@ -346,9 +375,14 @@ class HomeOpsWriteController extends Controller
                 'notes' => $data['notes'] ?? null,
                 'created_at' => now(),
                 'updated_at' => now(),
-            ]);
+            ];
+            $receiptPayload = HomeOpsV0::addHomeId($receiptPayload, 'receipts', $homeId);
+            $receiptPayload = HomeOpsV0::addRoomId($receiptPayload, 'receipts', $data['room_id'] ?? null);
+            $receiptPayload = HomeOpsV0::addAssetId($receiptPayload, 'receipts', $data['asset_id'] ?? null);
 
-            $this->autoLinkLedgerToPeriods($userId, $ledgerId, $entryDate);
+            $receiptId = DB::table('receipts')->insertGetId($receiptPayload);
+
+            $this->autoLinkLedgerToPeriods($userId, $homeId, $ledgerId, $entryDate);
 
             return response()->json([
                 'ok' => true,
@@ -360,9 +394,13 @@ class HomeOpsWriteController extends Controller
 
     public function storeLedgerEntry(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
+            'room_id' => ['nullable', 'integer'],
+            'asset_id' => ['nullable', 'integer'],
             'title' => ['required', 'string', 'max:180'],
             'vendor' => ['nullable', 'string', 'max:180'],
             'date' => ['required', 'date'],
@@ -372,7 +410,7 @@ class HomeOpsWriteController extends Controller
             'notes' => ['nullable', 'string'],
         ]);
 
-        return DB::transaction(function () use ($data, $userId) {
+        return DB::transaction(function () use ($data, $userId, $homeId) {
             $categoryId = $this->firstOrCreateCategory($userId, $data['category'] ?: 'Uncategorized Spending', 'spending');
             $vendorId = !empty($data['vendor'])
                 ? $this->firstOrCreateVendor($userId, $data['vendor'], 'store', $categoryId)
@@ -380,7 +418,7 @@ class HomeOpsWriteController extends Controller
 
             $entryDate = Carbon::parse($data['date'])->toDateString();
 
-            $ledgerId = DB::table('ledger_entries')->insertGetId([
+            $ledgerPayload = [
                 'user_id' => $userId,
                 'vendor_id' => $vendorId,
                 'category_id' => $categoryId,
@@ -394,9 +432,14 @@ class HomeOpsWriteController extends Controller
                 'notes' => $data['notes'] ?? null,
                 'created_at' => now(),
                 'updated_at' => now(),
-            ]);
+            ];
+            $ledgerPayload = HomeOpsV0::addHomeId($ledgerPayload, 'ledger_entries', $homeId);
+            $ledgerPayload = HomeOpsV0::addRoomId($ledgerPayload, 'ledger_entries', $data['room_id'] ?? null);
+            $ledgerPayload = HomeOpsV0::addAssetId($ledgerPayload, 'ledger_entries', $data['asset_id'] ?? null);
 
-            $this->autoLinkLedgerToPeriods($userId, $ledgerId, $entryDate);
+            $ledgerId = DB::table('ledger_entries')->insertGetId($ledgerPayload);
+
+            $this->autoLinkLedgerToPeriods($userId, $homeId, $ledgerId, $entryDate);
 
             return response()->json(['ok' => true, 'id' => $ledgerId], 201);
         });
@@ -404,9 +447,11 @@ class HomeOpsWriteController extends Controller
 
     public function storePeriod(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
             'title' => ['required', 'string', 'max:160'],
             'period_type' => ['required', Rule::in(['move', 'renovation', 'repair', 'emergency', 'travel', 'project', 'custom'])],
             'start_date' => ['required', 'date'],
@@ -415,11 +460,11 @@ class HomeOpsWriteController extends Controller
             'color' => ['nullable', 'string', 'max:30'],
         ]);
 
-        return DB::transaction(function () use ($data, $userId) {
+        return DB::transaction(function () use ($data, $userId, $homeId) {
             $startDate = Carbon::parse($data['start_date'])->toDateString();
             $endDate = Carbon::parse($data['end_date'])->toDateString();
 
-            $periodId = DB::table('spending_periods')->insertGetId([
+            $periodPayload = [
                 'user_id' => $userId,
                 'title' => $data['title'],
                 'period_type' => $data['period_type'],
@@ -430,12 +475,16 @@ class HomeOpsWriteController extends Controller
                 'active' => 1,
                 'created_at' => now(),
                 'updated_at' => now(),
-            ]);
+            ];
+            $periodPayload = HomeOpsV0::addHomeId($periodPayload, 'spending_periods', $homeId);
 
-            $ledgerIds = DB::table('ledger_entries')
+            $periodId = DB::table('spending_periods')->insertGetId($periodPayload);
+
+            $ledgerIdsQuery = DB::table('ledger_entries')
                 ->where('user_id', $userId)
-                ->whereBetween('entry_date', [$startDate, $endDate])
-                ->pluck('id');
+                ->whereBetween('entry_date', [$startDate, $endDate]);
+            HomeOpsV0::unqualifiedHomeFilter($ledgerIdsQuery, 'ledger_entries', $homeId);
+            $ledgerIds = $ledgerIdsQuery->pluck('id');
 
             foreach ($ledgerIds as $ledgerId) {
                 DB::table('period_ledger_entries')->insertOrIgnore([
@@ -456,9 +505,12 @@ class HomeOpsWriteController extends Controller
 
     public function storeMaintenanceItem(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
+            'asset_id' => ['nullable', 'integer'],
             'name' => ['required', 'string', 'max:180'],
             'location_label' => ['nullable', 'string', 'max:160'],
             'frequency_count' => ['nullable', 'integer', 'min:1'],
@@ -472,7 +524,7 @@ class HomeOpsWriteController extends Controller
 
         $categoryId = $this->firstOrCreateCategory($userId, 'Maintenance', 'maintenance');
 
-        $id = DB::table('maintenance_items')->insertGetId([
+        $payload = [
             'user_id' => $userId,
             'category_id' => $categoryId,
             'name' => $data['name'],
@@ -487,14 +539,19 @@ class HomeOpsWriteController extends Controller
             'notes' => $data['notes'] ?? null,
             'created_at' => now(),
             'updated_at' => now(),
-        ]);
+        ];
+        $payload = HomeOpsV0::addHomeId($payload, 'maintenance_items', $homeId);
+        $payload = HomeOpsV0::addAssetId($payload, 'maintenance_items', $data['asset_id'] ?? null);
+
+        $id = DB::table('maintenance_items')->insertGetId($payload);
 
         return response()->json(['ok' => true, 'id' => $id], 201);
     }
 
     public function completeMaintenanceItem(Request $request, int $itemId)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
             'completed_date' => ['nullable', 'date'],
@@ -502,18 +559,19 @@ class HomeOpsWriteController extends Controller
             'notes' => ['nullable', 'string'],
         ]);
 
-        return DB::transaction(function () use ($userId, $itemId, $data) {
-            $item = DB::table('maintenance_items')
+        return DB::transaction(function () use ($userId, $homeId, $itemId, $data) {
+            $itemQuery = DB::table('maintenance_items')
                 ->where('user_id', $userId)
-                ->where('id', $itemId)
-                ->first();
+                ->where('id', $itemId);
+            HomeOpsV0::unqualifiedHomeFilter($itemQuery, 'maintenance_items', $homeId);
+            $item = $itemQuery->first();
 
             abort_if(!$item, 404, 'Maintenance item not found.');
 
             $completedDate = Carbon::parse($data['completed_date'] ?? now()->toDateString());
             $nextDueDate = $this->nextDueDate($completedDate, $item->frequency_count, $item->frequency_unit);
 
-            DB::table('maintenance_logs')->insert([
+            $logPayload = [
                 'user_id' => $userId,
                 'maintenance_item_id' => $itemId,
                 'completed_date' => $completedDate->toDateString(),
@@ -521,7 +579,9 @@ class HomeOpsWriteController extends Controller
                 'notes' => $data['notes'] ?? null,
                 'created_at' => now(),
                 'updated_at' => now(),
-            ]);
+            ];
+            $logPayload = HomeOpsV0::addHomeId($logPayload, 'maintenance_logs', $homeId);
+            DB::table('maintenance_logs')->insert($logPayload);
 
             DB::table('maintenance_items')
                 ->where('id', $itemId)
@@ -540,9 +600,12 @@ class HomeOpsWriteController extends Controller
 
     public function storeWishlistItem(Request $request)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
         $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
+            'room_id' => ['nullable', 'integer'],
             'title' => ['required', 'string', 'max:180'],
             'item_type' => ['required', Rule::in(['need', 'want'])],
             'room_label' => ['nullable', 'string', 'max:120'],
@@ -555,7 +618,7 @@ class HomeOpsWriteController extends Controller
 
         $categoryId = $this->firstOrCreateCategory($userId, 'Needs & Wants', 'wishlist');
 
-        $id = DB::table('wishlist_items')->insertGetId([
+        $payload = [
             'user_id' => $userId,
             'category_id' => $categoryId,
             'title' => $data['title'],
@@ -569,22 +632,28 @@ class HomeOpsWriteController extends Controller
             'notes' => $data['notes'] ?? null,
             'created_at' => now(),
             'updated_at' => now(),
-        ]);
+        ];
+        $payload = HomeOpsV0::addHomeId($payload, 'wishlist_items', $homeId);
+        $payload = HomeOpsV0::addRoomId($payload, 'wishlist_items', $data['room_id'] ?? null);
+
+        $id = DB::table('wishlist_items')->insertGetId($payload);
 
         return response()->json(['ok' => true, 'id' => $id], 201);
     }
 
     public function markWishlistPurchased(Request $request, int $itemId)
     {
-        $userId = optional($request->user())->id ?? 1;
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
-        DB::table('wishlist_items')
+        $query = DB::table('wishlist_items')
             ->where('user_id', $userId)
-            ->where('id', $itemId)
-            ->update([
-                'status' => 'purchased',
-                'updated_at' => now(),
-            ]);
+            ->where('id', $itemId);
+        HomeOpsV0::unqualifiedHomeFilter($query, 'wishlist_items', $homeId);
+        $query->update([
+            'status' => 'purchased',
+            'updated_at' => now(),
+        ]);
 
         return response()->json(['ok' => true]);
     }
@@ -632,14 +701,15 @@ class HomeOpsWriteController extends Controller
         ]);
     }
 
-    private function autoLinkLedgerToPeriods(int $userId, int $ledgerId, string $entryDate): void
+    private function autoLinkLedgerToPeriods(int $userId, ?int $homeId, int $ledgerId, string $entryDate): void
     {
-        $periodIds = DB::table('spending_periods')
+        $periodIdsQuery = DB::table('spending_periods')
             ->where('user_id', $userId)
             ->where('active', 1)
             ->where('start_date', '<=', $entryDate)
-            ->where('end_date', '>=', $entryDate)
-            ->pluck('id');
+            ->where('end_date', '>=', $entryDate);
+        HomeOpsV0::unqualifiedHomeFilter($periodIdsQuery, 'spending_periods', $homeId);
+        $periodIds = $periodIdsQuery->pluck('id');
 
         foreach ($periodIds as $periodId) {
             DB::table('period_ledger_entries')->insertOrIgnore([
