@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Support\HomeOpsBillEngine;
 use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -18,6 +19,8 @@ class HomeOpsDashboardController extends Controller
 
         $monthStart = $period['month_start'];
         $monthEnd = $period['month_end'];
+
+        HomeOpsBillEngine::ensureMonthInstances($userId, $homeId, $monthStart);
 
         $monthStartString = $monthStart->toDateString();
         $monthEndString = $monthEnd->toDateString();
@@ -68,6 +71,11 @@ class HomeOpsDashboardController extends Controller
                 'due_date' => $dueDate,
                 'status' => $status,
                 'amount' => $amount !== null ? (float) $amount : null,
+                'frequency' => $bill->frequency,
+                'is_core_bill' => isset($bill->is_core_bill) ? (bool) $bill->is_core_bill : false,
+                'source_type' => $bill->source_type ?? null,
+                'source_key' => $bill->source_key ?? null,
+                'notes' => $bill->notes,
             ];
         })->values();
 

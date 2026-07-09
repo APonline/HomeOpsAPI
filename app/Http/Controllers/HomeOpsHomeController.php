@@ -25,12 +25,11 @@ class HomeOpsHomeController extends Controller
 
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
-        $homes = DB::table('homes')
-            ->where('user_id', $userId)
-            ->orderByDesc('is_primary')
-            ->orderBy('name')
+        $homes = HomeOpsV0::homesForUser($userId)
+            ->orderByDesc('homes.is_primary')
+            ->orderBy('homes.name')
             ->get()
-            ->map(fn ($home) => $this->serializeHome($home));
+            ->map(fn ($home) => $this->serializeHome($home, $userId));
 
         return response()->json([
             'homes' => $homes,
@@ -57,7 +56,7 @@ class HomeOpsHomeController extends Controller
         $data = $this->validateHome($request);
 
         return DB::transaction(function () use ($data, $userId) {
-            $isFirstHome = !DB::table('homes')->where('user_id', $userId)->exists();
+            $isFirstHome = !HomeOpsV0::homesForUser($userId)->exists();
             $isPrimary = (bool) ($data['is_primary'] ?? $isFirstHome);
 
             if ($isPrimary) {
@@ -65,6 +64,7 @@ class HomeOpsHomeController extends Controller
             }
 
             $homeId = DB::table('homes')->insertGetId($this->homeWritePayload($data, $userId, $isPrimary));
+            HomeOpsV0::attachHomeUser($userId, (int) $homeId, 'owner');
 
             $this->seedStarterRoomsAndAssets($userId, (int) $homeId);
 
@@ -79,12 +79,11 @@ class HomeOpsHomeController extends Controller
     {
         $userId = HomeOpsV0::userId($request);
 
+        $this->abortUnlessHome($userId, $homeId);
+
         $existing = DB::table('homes')
-            ->where('user_id', $userId)
             ->where('id', $homeId)
             ->first();
-
-        abort_if(!$existing, 404, 'Home not found.');
 
         $data = $this->validateHome($request, true);
         $isPrimary = (bool) ($data['is_primary'] ?? $existing->is_primary);
@@ -314,24 +313,23 @@ class HomeOpsHomeController extends Controller
 
     private function homePayload(int $userId, int $homeId): ?array
     {
-        $home = DB::table('homes')
-            ->where('user_id', $userId)
-            ->where('id', $homeId)
-            ->first();
+        $home = HomeOpsV0::userCanAccessHome($userId, $homeId)
+            ? DB::table('homes')->where('id', $homeId)->first()
+            : null;
 
         if (!$home) {
             return null;
         }
 
         return [
-            'home' => $this->serializeHome($home),
+            'home' => $this->serializeHome($home, $userId),
             'rooms' => Schema::hasTable('rooms') ? DB::table('rooms')->where('user_id', $userId)->where('home_id', $homeId)->orderBy('sort_order')->orderBy('name')->get() : [],
             'assets' => Schema::hasTable('home_assets') ? DB::table('home_assets')->where('user_id', $userId)->where('home_id', $homeId)->orderBy('asset_type')->orderBy('name')->get() : [],
             'timeline' => Schema::hasTable('ownership_events') ? DB::table('ownership_events')->where('user_id', $userId)->where('home_id', $homeId)->orderByDesc('event_date')->limit(25)->get() : [],
         ];
     }
 
-    private function serializeHome(object $home): array
+    private function serializeHome(object $home, ?int $viewerUserId = null): array
     {
         return [
             'id' => (int) $home->id,
@@ -357,15 +355,29 @@ class HomeOpsHomeController extends Controller
             'locker' => $home->locker,
             'service_notes' => $home->service_notes,
             'is_primary' => (bool) $home->is_primary,
+            'access_role' => $viewerUserId ? $this->accessRole($viewerUserId, (int) $home->id, (int) $home->user_id) : null,
         ];
+    }
+
+    private function accessRole(int $viewerUserId, int $homeId, int $ownerUserId): string
+    {
+        if ($viewerUserId === $ownerUserId) {
+            return 'owner';
+        }
+
+        if (!Schema::hasTable('property_users')) {
+            return 'viewer';
+        }
+
+        return (string) (DB::table('property_users')
+            ->where('home_id', $homeId)
+            ->where('user_id', $viewerUserId)
+            ->value('role') ?: 'viewer');
     }
 
     private function abortUnlessHome(int $userId, int $homeId): void
     {
-        $exists = Schema::hasTable('homes') && DB::table('homes')
-            ->where('user_id', $userId)
-            ->where('id', $homeId)
-            ->exists();
+        $exists = HomeOpsV0::userCanAccessHome($userId, $homeId);
 
         abort_unless($exists, 404, 'Home not found.');
     }

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Support\HomeOpsBillEngine;
 use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -16,6 +17,7 @@ class HomeOpsReadController extends Controller
         $period = HomeOpsV0::period($request);
         $monthStart = $period['month_start'];
         $monthEnd = $monthStart->copy()->endOfMonth();
+        $createdInstances = HomeOpsBillEngine::ensureMonthInstances($userId, $homeId, $monthStart);
 
         $billInstancesQuery = DB::table('bill_instances')
             ->where('user_id', $userId)
@@ -59,6 +61,9 @@ class HomeOpsReadController extends Controller
                     'expected_amount' => $bill->expected_amount !== null ? (float) $bill->expected_amount : null,
                     'frequency' => $bill->frequency,
                     'autopay' => (bool) $bill->autopay,
+                    'is_core_bill' => isset($bill->is_core_bill) ? (bool) $bill->is_core_bill : false,
+                    'source_type' => $bill->source_type ?? null,
+                    'source_key' => $bill->source_key ?? null,
                     'notes' => $bill->notes,
                 ];
             });
@@ -67,6 +72,7 @@ class HomeOpsReadController extends Controller
             'home' => HomeOpsV0::homeSummary($homeId),
             'period' => $this->periodPayload($period),
             'bills' => $bills,
+            'generated_instances' => $createdInstances,
         ]);
     }
 
@@ -126,6 +132,7 @@ class HomeOpsReadController extends Controller
     {
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+        $period = HomeOpsV0::period($request);
 
         $itemsQuery = DB::table('maintenance_items')
             ->where('user_id', $userId)
@@ -134,9 +141,27 @@ class HomeOpsReadController extends Controller
             ->orderByRaw("FIELD(priority, 'urgent', 'high', 'normal', 'low')");
         HomeOpsV0::unqualifiedHomeFilter($itemsQuery, 'maintenance_items', $homeId);
 
+        $items = $itemsQuery->get()->map(function ($item) use ($period) {
+            $dueDate = $item->next_due_date;
+            $inPeriod = $dueDate && $dueDate >= $period['date_from'] && $dueDate <= $period['date_to'];
+            $overdue = $dueDate && $dueDate < $period['selected_day'];
+
+            return (object) array_merge((array) $item, [
+                'in_selected_period' => (bool) $inPeriod,
+                'is_overdue' => (bool) $overdue,
+                'timing_label' => $overdue ? 'Overdue' : ($inPeriod ? 'In selected period' : 'Tracked'),
+            ]);
+        });
+
         return response()->json([
             'home' => HomeOpsV0::homeSummary($homeId),
-            'items' => $itemsQuery->get(),
+            'period' => $this->periodPayload($period),
+            'context' => [
+                'due_in_period' => $items->where('in_selected_period', true)->count(),
+                'overdue' => $items->where('is_overdue', true)->count(),
+                'tracked' => $items->count(),
+            ],
+            'items' => $items,
         ]);
     }
 
@@ -144,6 +169,7 @@ class HomeOpsReadController extends Controller
     {
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+        $period = HomeOpsV0::period($request);
 
         $itemsQuery = DB::table('wishlist_items')
             ->where('user_id', $userId)
@@ -153,9 +179,27 @@ class HomeOpsReadController extends Controller
             ->orderBy('title');
         HomeOpsV0::unqualifiedHomeFilter($itemsQuery, 'wishlist_items', $homeId);
 
+        $items = $itemsQuery->get()->map(function ($item) use ($period) {
+            $targetDate = $item->target_date;
+            $inPeriod = $targetDate && $targetDate >= $period['date_from'] && $targetDate <= $period['date_to'];
+            $overdue = $targetDate && $targetDate < $period['selected_day'];
+
+            return (object) array_merge((array) $item, [
+                'in_selected_period' => (bool) $inPeriod,
+                'is_overdue' => (bool) $overdue,
+                'timing_label' => $overdue ? 'Past target' : ($inPeriod ? 'Targeted here' : 'Tracked'),
+            ]);
+        });
+
         return response()->json([
             'home' => HomeOpsV0::homeSummary($homeId),
-            'items' => $itemsQuery->get(),
+            'period' => $this->periodPayload($period),
+            'context' => [
+                'targeted_in_period' => $items->where('in_selected_period', true)->count(),
+                'past_target' => $items->where('is_overdue', true)->count(),
+                'tracked' => $items->count(),
+            ],
+            'items' => $items,
         ]);
     }
 

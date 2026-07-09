@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Support\HomeOpsBillEngine;
 use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -21,6 +22,7 @@ class HomeOpsWriteController extends Controller
             'amount' => ['nullable', 'numeric', 'min:0'],
             'due_day' => ['nullable', 'integer', 'min:1', 'max:31'],
             'frequency' => ['required', Rule::in(['once', 'weekly', 'biweekly', 'monthly', 'quarterly', 'semiannual', 'annual'])],
+            'month' => ['nullable', 'date'],
             'notes' => ['nullable', 'string'],
         ]);
 
@@ -28,7 +30,7 @@ class HomeOpsWriteController extends Controller
             $vendorId = $this->firstOrCreateVendor($userId, $data['payee'], 'payee');
             $categoryId = $this->firstOrCreateCategory($userId, 'Bills', 'bill');
 
-            $monthStart = now()->startOfMonth();
+            $monthStart = Carbon::parse($data['month'] ?? now()->format('Y-m-01'))->startOfMonth();
             $dueDate = null;
 
             if (!empty($data['due_day'])) {
@@ -90,6 +92,7 @@ class HomeOpsWriteController extends Controller
             'amount' => ['nullable', 'numeric', 'min:0'],
             'due_day' => ['nullable', 'integer', 'min:1', 'max:31'],
             'frequency' => ['required', Rule::in(['once', 'weekly', 'biweekly', 'monthly', 'quarterly', 'semiannual', 'annual'])],
+            'month' => ['nullable', 'date'],
             'notes' => ['nullable', 'string'],
         ]);
 
@@ -105,7 +108,7 @@ class HomeOpsWriteController extends Controller
             $vendorId = $this->firstOrCreateVendor($userId, $data['payee'], 'payee');
             $categoryId = $bill->category_id ?: $this->firstOrCreateCategory($userId, 'Bills', 'bill');
 
-            $monthStart = now()->startOfMonth();
+            $monthStart = Carbon::parse($data['month'] ?? now()->format('Y-m-01'))->startOfMonth();
             $monthEnd = $monthStart->copy()->endOfMonth();
             $dueDate = null;
 
@@ -320,6 +323,130 @@ class HomeOpsWriteController extends Controller
                 'message' => 'Bill marked paid.',
             ]);
         });
+    }
+
+
+    public function updateBillInstance(Request $request, int $instanceId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+
+        $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
+            'expected_amount' => ['nullable', 'numeric', 'min:0'],
+            'actual_amount' => ['nullable', 'numeric', 'min:0'],
+            'due_date' => ['nullable', 'date'],
+            'status' => ['nullable', Rule::in(['expected', 'pending', 'partial', 'paid', 'missed', 'skipped'])],
+            'paid_at' => ['nullable', 'date'],
+        ]);
+
+        $instanceQuery = DB::table('bill_instances')
+            ->where('user_id', $userId)
+            ->where('id', $instanceId);
+        HomeOpsV0::unqualifiedHomeFilter($instanceQuery, 'bill_instances', $homeId);
+        $instance = $instanceQuery->first();
+
+        abort_if(!$instance, 404, 'Bill month not found.');
+
+        $payload = [
+            'updated_at' => now(),
+        ];
+
+        foreach (['expected_amount', 'actual_amount', 'status'] as $field) {
+            if (array_key_exists($field, $data)) {
+                $payload[$field] = $data[$field];
+            }
+        }
+
+        if (!empty($data['due_date'])) {
+            $payload['due_date'] = Carbon::parse($data['due_date'])->toDateString();
+        }
+
+        if (!empty($data['paid_at'])) {
+            $payload['paid_at'] = Carbon::parse($data['paid_at'])->toDateString();
+        }
+
+        DB::table('bill_instances')
+            ->where('id', $instanceId)
+            ->update($payload);
+
+        return response()->json([
+            'ok' => true,
+            'id' => $instanceId,
+            'message' => 'This month was updated.',
+        ]);
+    }
+
+    public function skipBillForMonth(Request $request, int $billId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+
+        $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
+            'month' => ['nullable', 'date'],
+        ]);
+
+        $monthStart = Carbon::parse($data['month'] ?? now()->format('Y-m-01'))->startOfMonth();
+        $instance = HomeOpsBillEngine::ensureBillInstance($userId, $homeId, $billId, $monthStart);
+
+        abort_if(!$instance, 404, 'Bill month not found.');
+
+        DB::table('bill_instances')
+            ->where('id', $instance->id)
+            ->update([
+                'actual_amount' => 0,
+                'status' => 'skipped',
+                'paid_at' => null,
+                'updated_at' => now(),
+            ]);
+
+        DB::table('ledger_entries')
+            ->where('user_id', $userId)
+            ->where('bill_instance_id', $instance->id)
+            ->delete();
+
+        return response()->json([
+            'ok' => true,
+            'bill_instance_id' => $instance->id,
+            'message' => 'Bill skipped for this month.',
+        ]);
+    }
+
+    public function markBillUnpaid(Request $request, int $billId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+
+        $data = $request->validate([
+            'home_id' => ['nullable', 'integer'],
+            'month' => ['nullable', 'date'],
+        ]);
+
+        $monthStart = Carbon::parse($data['month'] ?? now()->format('Y-m-01'))->startOfMonth();
+        $instance = HomeOpsBillEngine::ensureBillInstance($userId, $homeId, $billId, $monthStart);
+
+        abort_if(!$instance, 404, 'Bill month not found.');
+
+        DB::table('bill_instances')
+            ->where('id', $instance->id)
+            ->update([
+                'actual_amount' => null,
+                'status' => 'expected',
+                'paid_at' => null,
+                'updated_at' => now(),
+            ]);
+
+        DB::table('ledger_entries')
+            ->where('user_id', $userId)
+            ->where('bill_instance_id', $instance->id)
+            ->delete();
+
+        return response()->json([
+            'ok' => true,
+            'bill_instance_id' => $instance->id,
+            'message' => 'Bill reset to unpaid for this month.',
+        ]);
     }
 
     public function storeReceipt(Request $request)

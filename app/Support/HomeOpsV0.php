@@ -12,7 +12,11 @@ class HomeOpsV0
 {
     public static function userId(Request $request): int
     {
-        return optional($request->user())->id ?? 1;
+        $userId = optional($request->user())->id;
+
+        abort_unless($userId, 401, 'Unauthenticated.');
+
+        return (int) $userId;
     }
 
     public static function resolveHomeId(Request $request, int $userId): ?int
@@ -20,6 +24,7 @@ class HomeOpsV0
         $requestedHomeId = $request->input('home_id', $request->query('home_id'));
 
         if ($requestedHomeId) {
+            abort_unless(self::userCanAccessHome($userId, (int) $requestedHomeId), 404, 'Property not found.');
             return (int) $requestedHomeId;
         }
 
@@ -32,34 +37,110 @@ class HomeOpsV0
             return null;
         }
 
-        $home = DB::table('homes')
-            ->where('user_id', $userId)
-            ->orderByDesc('is_primary')
-            ->orderBy('id')
+        $home = self::homesForUser($userId)
+            ->orderByDesc('homes.is_primary')
+            ->orderBy('homes.id')
             ->first();
 
         if ($home) {
             return (int) $home->id;
         }
 
-        return (int) DB::table('homes')->insertGetId([
+        return self::createStarterHomeForUser($userId, 'My Home', 'townhouse');
+    }
+
+    public static function homesForUser(int $userId): Builder
+    {
+        $query = DB::table('homes')->select('homes.*');
+
+        if (Schema::hasTable('property_users')) {
+            $query->leftJoin('property_users', function ($join) use ($userId) {
+                $join->on('property_users.home_id', '=', 'homes.id')
+                    ->where('property_users.user_id', '=', $userId);
+            })->where(function ($nested) use ($userId) {
+                $nested->where('homes.user_id', $userId)
+                    ->orWhereNotNull('property_users.id');
+            });
+        } else {
+            $query->where('homes.user_id', $userId);
+        }
+
+        return $query->distinct();
+    }
+
+    public static function userCanAccessHome(int $userId, int $homeId, array $roles = []): bool
+    {
+        if (!Schema::hasTable('homes')) {
+            return false;
+        }
+
+        $ownsHome = DB::table('homes')
+            ->where('id', $homeId)
+            ->where('user_id', $userId)
+            ->exists();
+
+        if ($ownsHome) {
+            return true;
+        }
+
+        if (!Schema::hasTable('property_users')) {
+            return false;
+        }
+
+        $query = DB::table('property_users')
+            ->where('home_id', $homeId)
+            ->where('user_id', $userId);
+
+        if ($roles) {
+            $query->whereIn('role', $roles);
+        }
+
+        return $query->exists();
+    }
+
+    public static function attachHomeUser(int $userId, int $homeId, string $role = 'owner'): void
+    {
+        if (!Schema::hasTable('property_users')) {
+            return;
+        }
+
+        DB::table('property_users')->insertOrIgnore([
+            'home_id' => $homeId,
             'user_id' => $userId,
-            'name' => 'My Home',
-            'property_type' => 'townhouse',
-            'city_region' => 'Toronto, ON',
-            'purchase_date' => '2026-06-05',
-            'purchase_price' => 425000,
-            'square_footage' => 700,
-            'currency' => 'CAD',
-            'mortgage_payment' => 1985,
-            'hoa_fee' => 727,
-            'property_tax' => 220,
-            'occupancy_status' => 'owner_occupied',
-            'primary_use' => 'primary_residence',
-            'is_primary' => 1,
+            'role' => $role,
             'created_at' => now(),
             'updated_at' => now(),
         ]);
+    }
+
+    public static function createStarterHomeForUser(int $userId, string $name = 'My Home', string $propertyType = 'townhouse'): int
+    {
+        abort_unless(Schema::hasTable('homes'), 500, 'Run migrations to enable Property Identity.');
+
+        $isFirstHome = !self::homesForUser($userId)->exists();
+
+        $homeId = (int) DB::table('homes')->insertGetId([
+            'user_id' => $userId,
+            'name' => $name,
+            'property_type' => $propertyType,
+            'city_region' => $propertyType === 'townhouse' ? 'Toronto, ON' : null,
+            'purchase_date' => $propertyType === 'townhouse' ? '2026-06-05' : null,
+            'purchase_price' => $propertyType === 'townhouse' ? 425000 : null,
+            'square_footage' => $propertyType === 'townhouse' ? 700 : null,
+            'currency' => 'CAD',
+            'mortgage_payment' => $propertyType === 'townhouse' ? 1985 : null,
+            'hoa_fee' => $propertyType === 'townhouse' ? 727 : null,
+            'property_tax' => $propertyType === 'townhouse' ? 220 : null,
+            'occupancy_status' => $propertyType === 'cottage' ? 'seasonal' : 'owner_occupied',
+            'primary_use' => $propertyType === 'cottage' ? 'cottage' : 'primary_residence',
+            'is_primary' => $isFirstHome ? 1 : 0,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        self::attachHomeUser($userId, $homeId, 'owner');
+
+        return $homeId;
     }
 
     public static function homeSummary(?int $homeId): ?array
