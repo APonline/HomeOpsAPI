@@ -7,6 +7,7 @@ use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class HomeOpsReadController extends Controller
 {
@@ -124,7 +125,9 @@ class HomeOpsReadController extends Controller
         return response()->json([
             'home' => HomeOpsV0::homeSummary($homeId),
             'period' => $this->periodPayload($period),
-            'periods' => $this->periodsForRange($userId, $homeId, $period['date_from'], $period['date_to']),
+            // The management page should show the complete property history, not only
+            // periods that overlap the currently selected dashboard day/month.
+            'periods' => $this->allSpendingPeriods($userId, $homeId, $period['date_from'], $period['date_to']),
         ]);
     }
 
@@ -133,23 +136,49 @@ class HomeOpsReadController extends Controller
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
         $period = HomeOpsV0::period($request);
+        $hasRoomId = Schema::hasColumn('maintenance_items', 'room_id') && Schema::hasTable('rooms');
+        $hasInventory = Schema::hasColumn('maintenance_items', 'tracks_inventory');
 
         $itemsQuery = DB::table('maintenance_items')
-            ->where('user_id', $userId)
-            ->where('status', 'active')
-            ->orderByRaw('COALESCE(next_due_date, "9999-12-31")')
-            ->orderByRaw("FIELD(priority, 'urgent', 'high', 'normal', 'low')");
-        HomeOpsV0::unqualifiedHomeFilter($itemsQuery, 'maintenance_items', $homeId);
+            ->where('maintenance_items.user_id', $userId)
+            ->where('maintenance_items.status', 'active')
+            ->orderByRaw('COALESCE(maintenance_items.next_due_date, "9999-12-31")')
+            ->orderByRaw("FIELD(maintenance_items.priority, 'urgent', 'high', 'normal', 'low')");
 
-        $items = $itemsQuery->get()->map(function ($item) use ($period) {
+        if ($hasRoomId) {
+            $itemsQuery->leftJoin('rooms', 'rooms.id', '=', 'maintenance_items.room_id');
+        }
+
+        HomeOpsV0::homeFilter($itemsQuery, 'maintenance_items', $homeId);
+
+        $columns = ['maintenance_items.*'];
+        if ($hasRoomId) {
+            $columns[] = 'rooms.name as room_name';
+        }
+
+        $items = $itemsQuery->get($columns)->map(function ($item) use ($period, $hasInventory) {
             $dueDate = $item->next_due_date;
             $inPeriod = $dueDate && $dueDate >= $period['date_from'] && $dueDate <= $period['date_to'];
             $overdue = $dueDate && $dueDate < $period['selected_day'];
+            $tracksInventory = $hasInventory && (bool) ($item->tracks_inventory ?? false);
+            $quantityOnHand = $tracksInventory ? max(0, (int) ($item->quantity_on_hand ?? 0)) : null;
+            $unitsPerService = $tracksInventory ? max(1, (int) ($item->units_per_service ?? 1)) : null;
+            $servicesRemaining = $tracksInventory ? intdiv($quantityOnHand, $unitsPerService) : null;
+            $restockCost = $tracksInventory
+                ? (isset($item->restock_cost) && $item->restock_cost !== null ? (float) $item->restock_cost : (float) ($item->estimated_cost ?? 0))
+                : null;
 
             return (object) array_merge((array) $item, [
+                'room_name' => $item->room_name ?? null,
                 'in_selected_period' => (bool) $inPeriod,
                 'is_overdue' => (bool) $overdue,
-                'timing_label' => $overdue ? 'Overdue' : ($inPeriod ? 'In selected period' : 'Tracked'),
+                'timing_label' => $overdue ? 'Overdue' : ($inPeriod ? 'Due in selected period' : 'Tracked'),
+                'tracks_inventory' => $tracksInventory,
+                'quantity_on_hand' => $quantityOnHand,
+                'units_per_service' => $unitsPerService,
+                'stock_services_remaining' => $servicesRemaining,
+                'needs_restock' => $tracksInventory ? $quantityOnHand < $unitsPerService : false,
+                'restock_cost' => $restockCost ?: null,
             ]);
         });
 
@@ -160,6 +189,7 @@ class HomeOpsReadController extends Controller
                 'due_in_period' => $items->where('in_selected_period', true)->count(),
                 'overdue' => $items->where('is_overdue', true)->count(),
                 'tracked' => $items->count(),
+                'needs_restock' => $items->where('needs_restock', true)->count(),
             ],
             'items' => $items,
         ]);
@@ -203,6 +233,24 @@ class HomeOpsReadController extends Controller
         ]);
     }
 
+    private function allSpendingPeriods(int $userId, ?int $homeId, string $dateFrom, string $dateTo)
+    {
+        $periodsQuery = DB::table('spending_periods')
+            ->where('user_id', $userId)
+            ->where('active', 1)
+            ->orderByDesc('start_date')
+            ->orderByDesc('id');
+        HomeOpsV0::unqualifiedHomeFilter($periodsQuery, 'spending_periods', $homeId);
+
+        return $this->formatSpendingPeriods(
+            $periodsQuery->get(),
+            $userId,
+            $homeId,
+            $dateFrom,
+            $dateTo
+        );
+    }
+
     private function periodsForRange(int $userId, ?int $homeId, string $dateFrom, string $dateTo)
     {
         $periodsQuery = DB::table('spending_periods')
@@ -218,9 +266,18 @@ class HomeOpsReadController extends Controller
             })
             ->orderBy('start_date');
         HomeOpsV0::unqualifiedHomeFilter($periodsQuery, 'spending_periods', $homeId);
-        $periods = $periodsQuery->get();
+        return $this->formatSpendingPeriods(
+            $periodsQuery->get(),
+            $userId,
+            $homeId,
+            $dateFrom,
+            $dateTo
+        );
+    }
 
-        return $periods->map(function ($period) use ($userId, $homeId) {
+    private function formatSpendingPeriods($periods, int $userId, ?int $homeId, string $dateFrom, string $dateTo)
+    {
+        return $periods->map(function ($period) use ($userId, $homeId, $dateFrom, $dateTo) {
             $ledger = DB::table('ledger_entries')
                 ->where('user_id', $userId)
                 ->where('direction', 'out')
@@ -228,12 +285,18 @@ class HomeOpsReadController extends Controller
                 ->whereBetween('entry_date', [$period->start_date, $period->end_date]);
             HomeOpsV0::unqualifiedHomeFilter($ledger, 'ledger_entries', $homeId);
 
+            $inSelectedContext = $period->start_date <= $dateTo && $period->end_date >= $dateFrom;
+            $today = now()->toDateString();
+            $timingLabel = $period->start_date > $today
+                ? 'Upcoming'
+                : ($period->end_date < $today ? 'Completed' : 'In progress');
+
             return [
                 'id' => (int) $period->id,
                 'home_id' => isset($period->home_id) ? (int) $period->home_id : null,
                 'name' => $period->title,
                 'title' => $period->title,
-                'dates' => Carbon::parse($period->start_date)->format('M j') . '–' . Carbon::parse($period->end_date)->format('M j'),
+                'dates' => Carbon::parse($period->start_date)->format('M j, Y') . '–' . Carbon::parse($period->end_date)->format('M j, Y'),
                 'start_date' => $period->start_date,
                 'end_date' => $period->end_date,
                 'amount' => (float) $ledger->sum('total_amount'),
@@ -241,6 +304,8 @@ class HomeOpsReadController extends Controller
                 'notes' => $period->notes,
                 'description' => $period->notes,
                 'period_type' => $period->period_type,
+                'timing_label' => $timingLabel,
+                'in_selected_context' => $inSelectedContext,
                 'tone' => $period->period_type === 'renovation' ? 'tan' : 'red',
             ];
         })->values();

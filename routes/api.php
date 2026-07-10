@@ -9,6 +9,8 @@ use App\Http\Controllers\HomeOpsHomeController;
 use App\Http\Controllers\HomeOpsBudgetController;
 use App\Http\Controllers\HomeOpsCoreBillsController;
 use App\Http\Controllers\HomeOpsV0StatusController;
+use App\Http\Controllers\HomeOpsRecordsController;
+use App\Http\Controllers\HomeOpsV1Controller;
 use App\Http\Middleware\HomeOpsTokenAuth;
 
 Route::prefix('homeops')->group(function () {
@@ -57,20 +59,45 @@ Route::prefix('homeops')->group(function () {
         Route::patch('/bills/{billId}', [HomeOpsWriteController::class, 'updateBill']);
         Route::delete('/bills/{billId}', [HomeOpsWriteController::class, 'deleteBill']);
 
+        Route::get('/receipts', [HomeOpsRecordsController::class, 'receipts']);
         Route::post('/receipts', [HomeOpsWriteController::class, 'storeReceipt']);
+        Route::patch('/receipts/{receiptId}', [HomeOpsRecordsController::class, 'updateReceipt']);
+        Route::delete('/receipts/{receiptId}', [HomeOpsRecordsController::class, 'deleteReceipt']);
 
         Route::get('/ledger-entries', [HomeOpsReadController::class, 'ledgerEntries']);
         Route::post('/ledger-entries', [HomeOpsWriteController::class, 'storeLedgerEntry']);
+        Route::patch('/ledger-entries/{entryId}', [HomeOpsRecordsController::class, 'updateLedgerEntry']);
+        Route::delete('/ledger-entries/{entryId}', [HomeOpsRecordsController::class, 'deleteLedgerEntry']);
 
         Route::get('/spending-periods', [HomeOpsReadController::class, 'spendingPeriods']);
         Route::post('/spending-periods', [HomeOpsWriteController::class, 'storePeriod']);
+        Route::patch('/spending-periods/{periodId}', [HomeOpsRecordsController::class, 'updatePeriod']);
+        Route::delete('/spending-periods/{periodId}', [HomeOpsRecordsController::class, 'deletePeriod']);
 
         Route::get('/maintenance-items', [HomeOpsReadController::class, 'maintenanceItems']);
         Route::post('/maintenance-items', [HomeOpsWriteController::class, 'storeMaintenanceItem']);
         Route::patch('/maintenance-items/{itemId}/complete', [HomeOpsWriteController::class, 'completeMaintenanceItem']);
+        Route::patch('/maintenance-items/{itemId}/restock', [HomeOpsWriteController::class, 'restockMaintenanceItem']);
+        Route::patch('/maintenance-items/{itemId}', [HomeOpsRecordsController::class, 'updateMaintenanceItem']);
+        Route::delete('/maintenance-items/{itemId}', [HomeOpsRecordsController::class, 'deleteMaintenanceItem']);
+        Route::get('/maintenance-items/{itemId}/logs', [HomeOpsRecordsController::class, 'maintenanceLogs']);
 
         Route::get('/wishlist-items', [HomeOpsReadController::class, 'wishlistItems']);
         Route::post('/wishlist-items', [HomeOpsWriteController::class, 'storeWishlistItem']);
         Route::patch('/wishlist-items/{itemId}/purchased', [HomeOpsWriteController::class, 'markWishlistPurchased']);
+        Route::patch('/wishlist-items/{itemId}', [HomeOpsRecordsController::class, 'updateWishlistItem']);
+        Route::delete('/wishlist-items/{itemId}', [HomeOpsRecordsController::class, 'deleteWishlistItem']);
+
+        Route::get('/financial-accounts', [HomeOpsV1Controller::class, 'financialAccounts']);
+        Route::post('/financial-accounts', [HomeOpsV1Controller::class, 'storeFinancialAccount']);
+        Route::patch('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'updateFinancialAccount']);
+        Route::delete('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'deleteFinancialAccount']);
+
+        Route::get('/documents', [HomeOpsV1Controller::class, 'documents']);
+        Route::post('/documents', [HomeOpsV1Controller::class, 'storeDocument']);
+        Route::patch('/documents/{documentId}', [HomeOpsV1Controller::class, 'updateDocument']);
+        Route::delete('/documents/{documentId}', [HomeOpsV1Controller::class, 'deleteDocument']);
+
+        Route::get('/reports', [HomeOpsV1Controller::class, 'reports']);
     });
 });

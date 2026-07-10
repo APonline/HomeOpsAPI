@@ -7,6 +7,7 @@ use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 
 class HomeOpsWriteController extends Controller
@@ -637,6 +638,7 @@ class HomeOpsWriteController extends Controller
 
         $data = $request->validate([
             'home_id' => ['nullable', 'integer'],
+            'room_id' => ['nullable', 'integer'],
             'asset_id' => ['nullable', 'integer'],
             'name' => ['required', 'string', 'max:180'],
             'location_label' => ['nullable', 'string', 'max:160'],
@@ -647,8 +649,15 @@ class HomeOpsWriteController extends Controller
             'priority' => ['required', Rule::in(['low', 'normal', 'high', 'urgent'])],
             'instructions' => ['nullable', 'string'],
             'notes' => ['nullable', 'string'],
+            'tracks_inventory' => ['nullable', 'boolean'],
+            'quantity_on_hand' => ['nullable', 'integer', 'min:0'],
+            'units_per_service' => ['nullable', 'integer', 'min:1'],
+            'pack_quantity' => ['nullable', 'integer', 'min:1'],
+            'restock_cost' => ['nullable', 'numeric', 'min:0'],
+            'inventory_unit' => ['nullable', 'string', 'max:60'],
         ]);
 
+        $roomId = $this->resolveRoomId($userId, $homeId, $data['room_id'] ?? null);
         $categoryId = $this->firstOrCreateCategory($userId, 'Maintenance', 'maintenance');
 
         $payload = [
@@ -667,7 +676,19 @@ class HomeOpsWriteController extends Controller
             'created_at' => now(),
             'updated_at' => now(),
         ];
+
+        if (Schema::hasColumn('maintenance_items', 'tracks_inventory')) {
+            $tracksInventory = !empty($data['tracks_inventory']);
+            $payload['tracks_inventory'] = $tracksInventory;
+            $payload['quantity_on_hand'] = $tracksInventory ? (int) ($data['quantity_on_hand'] ?? 0) : 0;
+            $payload['units_per_service'] = $tracksInventory ? max(1, (int) ($data['units_per_service'] ?? 1)) : 1;
+            $payload['pack_quantity'] = $tracksInventory ? ($data['pack_quantity'] ?? null) : null;
+            $payload['restock_cost'] = $tracksInventory ? ($data['restock_cost'] ?? null) : null;
+            $payload['inventory_unit'] = $tracksInventory ? ($data['inventory_unit'] ?? null) : null;
+        }
+
         $payload = HomeOpsV0::addHomeId($payload, 'maintenance_items', $homeId);
+        $payload = HomeOpsV0::addRoomId($payload, 'maintenance_items', $roomId);
         $payload = HomeOpsV0::addAssetId($payload, 'maintenance_items', $data['asset_id'] ?? null);
 
         $id = DB::table('maintenance_items')->insertGetId($payload);
@@ -691,12 +712,18 @@ class HomeOpsWriteController extends Controller
                 ->where('user_id', $userId)
                 ->where('id', $itemId);
             HomeOpsV0::unqualifiedHomeFilter($itemQuery, 'maintenance_items', $homeId);
-            $item = $itemQuery->first();
+            $item = $itemQuery->lockForUpdate()->first();
 
             abort_if(!$item, 404, 'Maintenance item not found.');
 
             $completedDate = Carbon::parse($data['completed_date'] ?? now()->toDateString());
             $nextDueDate = $this->nextDueDate($completedDate, $item->frequency_count, $item->frequency_unit);
+            $tracksInventory = Schema::hasColumn('maintenance_items', 'tracks_inventory')
+                && (bool) ($item->tracks_inventory ?? false);
+            $quantityBefore = $tracksInventory ? max(0, (int) ($item->quantity_on_hand ?? 0)) : null;
+            $unitsUsed = $tracksInventory ? max(1, (int) ($item->units_per_service ?? 1)) : 0;
+            $quantityAfter = $tracksInventory ? max(0, $quantityBefore - $unitsUsed) : null;
+            $quantityDelta = $tracksInventory ? $quantityAfter - $quantityBefore : 0;
 
             $logPayload = [
                 'user_id' => $userId,
@@ -707,20 +734,97 @@ class HomeOpsWriteController extends Controller
                 'created_at' => now(),
                 'updated_at' => now(),
             ];
+            if (Schema::hasColumn('maintenance_logs', 'log_type')) {
+                $logPayload['log_type'] = 'completed';
+                $logPayload['quantity_delta'] = $quantityDelta;
+                $logPayload['quantity_after'] = $quantityAfter;
+            }
             $logPayload = HomeOpsV0::addHomeId($logPayload, 'maintenance_logs', $homeId);
             DB::table('maintenance_logs')->insert($logPayload);
 
+            $updatePayload = [
+                'last_done_date' => $completedDate->toDateString(),
+                'next_due_date' => $nextDueDate,
+                'updated_at' => now(),
+            ];
+            if ($tracksInventory) {
+                $updatePayload['quantity_on_hand'] = $quantityAfter;
+            }
+
             DB::table('maintenance_items')
                 ->where('id', $itemId)
-                ->update([
-                    'last_done_date' => $completedDate->toDateString(),
-                    'next_due_date' => $nextDueDate,
-                    'updated_at' => now(),
-                ]);
+                ->update($updatePayload);
 
             return response()->json([
                 'ok' => true,
                 'next_due_date' => $nextDueDate,
+                'quantity_on_hand' => $quantityAfter,
+                'needs_restock' => $tracksInventory ? $quantityAfter < $unitsUsed : false,
+            ]);
+        });
+    }
+
+    public function restockMaintenanceItem(Request $request, int $itemId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+
+        $data = $request->validate([
+            'quantity' => ['required', 'integer', 'min:1'],
+            'cost_amount' => ['nullable', 'numeric', 'min:0'],
+            'restocked_date' => ['nullable', 'date'],
+            'notes' => ['nullable', 'string'],
+        ]);
+
+        abort_unless(
+            Schema::hasColumn('maintenance_items', 'tracks_inventory')
+                && Schema::hasColumn('maintenance_items', 'quantity_on_hand'),
+            422,
+            'Run the maintenance inventory migration before restocking.'
+        );
+
+        return DB::transaction(function () use ($userId, $homeId, $itemId, $data) {
+            $itemQuery = DB::table('maintenance_items')
+                ->where('user_id', $userId)
+                ->where('id', $itemId);
+            HomeOpsV0::unqualifiedHomeFilter($itemQuery, 'maintenance_items', $homeId);
+            $item = $itemQuery->lockForUpdate()->first();
+
+            abort_if(!$item, 404, 'Maintenance item not found.');
+
+            $quantityBefore = max(0, (int) ($item->quantity_on_hand ?? 0));
+            $quantityAdded = (int) $data['quantity'];
+            $quantityAfter = $quantityBefore + $quantityAdded;
+            $restockedDate = Carbon::parse($data['restocked_date'] ?? now()->toDateString());
+
+            DB::table('maintenance_items')->where('id', $itemId)->update([
+                'tracks_inventory' => 1,
+                'quantity_on_hand' => $quantityAfter,
+                'pack_quantity' => $quantityAdded,
+                'restock_cost' => $data['cost_amount'] ?? $item->restock_cost ?? null,
+                'updated_at' => now(),
+            ]);
+
+            $logPayload = [
+                'user_id' => $userId,
+                'maintenance_item_id' => $itemId,
+                'completed_date' => $restockedDate->toDateString(),
+                'cost_amount' => $data['cost_amount'] ?? null,
+                'notes' => $data['notes'] ?? 'Stock replenished.',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+            if (Schema::hasColumn('maintenance_logs', 'log_type')) {
+                $logPayload['log_type'] = 'restocked';
+                $logPayload['quantity_delta'] = $quantityAdded;
+                $logPayload['quantity_after'] = $quantityAfter;
+            }
+            $logPayload = HomeOpsV0::addHomeId($logPayload, 'maintenance_logs', $homeId);
+            DB::table('maintenance_logs')->insert($logPayload);
+
+            return response()->json([
+                'ok' => true,
+                'quantity_on_hand' => $quantityAfter,
             ]);
         });
     }
@@ -783,6 +887,23 @@ class HomeOpsWriteController extends Controller
         ]);
 
         return response()->json(['ok' => true]);
+    }
+
+    private function resolveRoomId(int $userId, ?int $homeId, mixed $roomId): ?int
+    {
+        if (!$roomId || !$homeId || !Schema::hasTable('rooms')) {
+            return null;
+        }
+
+        $exists = DB::table('rooms')
+            ->where('id', (int) $roomId)
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->exists();
+
+        abort_unless($exists, 422, 'The selected room does not belong to this property.');
+
+        return (int) $roomId;
     }
 
     private function firstOrCreateCategory(int $userId, string $name, string $type): int

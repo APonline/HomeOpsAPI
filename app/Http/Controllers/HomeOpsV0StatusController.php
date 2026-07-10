@@ -55,13 +55,13 @@ class HomeOpsV0StatusController extends Controller
     private function schemaChecks(): array
     {
         return [
-            $this->check('schema.homes', 'Home Identity tables', $this->hasTable('homes') && $this->hasTable('rooms') && $this->hasTable('home_assets'), 'Required before V1 can link docs/OCR/accounts to a property.'),
-            $this->check('schema.ownership_timeline', 'Ownership timeline table', $this->hasTable('ownership_events'), 'V0 history layer for move-in, repairs, setup, and upgrades.'),
+            $this->check('schema.homes', 'Home Identity tables', $this->hasTable('homes') && $this->hasTable('rooms') && $this->hasTable('home_assets'), 'Required so documents, accounts, and records stay linked to the correct property.'),
+            $this->check('schema.ownership_timeline', 'Ownership timeline table', $this->hasTable('ownership_events'), 'Keeps move-in, repair, setup, and upgrade history together.'),
             $this->check('schema.bill_home_context', 'Bills have home context', $this->hasColumn('bills', 'home_id') && $this->hasColumn('bill_instances', 'home_id'), 'Bills and monthly instances need home_id.'),
             $this->check('schema.core_bill_source', 'Core bills source metadata', $this->hasColumn('bills', 'source_type') && $this->hasColumn('bills', 'source_key') && $this->hasColumn('bills', 'is_core_bill'), 'Prevents duplicated Mortgage / HOA / Internet rows.'),
-            $this->check('schema.ledger_home_context', 'Ledger/receipts have home context', $this->hasColumn('ledger_entries', 'home_id') && $this->hasColumn('receipts', 'home_id'), 'Needed before receipt OCR in V1.'),
+            $this->check('schema.ledger_home_context', 'Ledger/receipts have home context', $this->hasColumn('ledger_entries', 'home_id') && $this->hasColumn('receipts', 'home_id'), 'Keeps ledger entries and receipts attached to the correct property.'),
             $this->check('schema.living_home_context', 'Living modules have home context', $this->hasColumn('maintenance_items', 'home_id') && $this->hasColumn('wishlist_items', 'home_id') && $this->hasColumn('spending_periods', 'home_id'), 'Maintenance, needs/wants and periods should not float globally.'),
-            $this->check('schema.room_asset_links', 'Room/asset link columns', $this->hasColumn('maintenance_items', 'asset_id') && $this->hasColumn('wishlist_items', 'room_id') && $this->hasColumn('ledger_entries', 'room_id'), 'V1 documents and receipts need room/asset hooks.'),
+            $this->check('schema.room_asset_links', 'Room/asset link columns', $this->hasColumn('maintenance_items', 'asset_id') && $this->hasColumn('wishlist_items', 'room_id') && $this->hasColumn('ledger_entries', 'room_id'), 'Lets documents, receipts, and maintenance attach to rooms and assets.'),
             $this->check('schema.budget_profile', 'Budget Lens API table', $this->hasTable('budget_profiles'), 'Saved budget assumptions should survive browsers/devices.'),
         ];
     }
@@ -75,8 +75,8 @@ class HomeOpsV0StatusController extends Controller
             $this->check('product.month_instances', 'Current month bill instances exist', (int) ($counts['bill_instances_this_month'] ?? 0) >= (int) ($counts['active_bills'] ?? 0), 'Open Bills once to generate selected-month instances.', (int) ($counts['active_bills'] ?? 0) === 0),
             $this->check('product.time_records', 'Records respect selected period', (int) ($counts['ledger_entries_in_period'] ?? 0) >= 0 && $this->hasColumn('ledger_entries', 'home_id'), 'Ledger and receipts are queried by Home + Time.'),
             $this->check('product.period_context', 'Spending periods available', (int) ($counts['spending_periods_in_context'] ?? 0) > 0, 'Optional but useful: create Moving Chaos / AC Repair / setup periods.', false, true),
-            $this->check('product.rooms_assets', 'Rooms/assets started', ((int) ($counts['rooms'] ?? 0) + (int) ($counts['assets'] ?? 0)) > 0, 'Add starter rooms/assets so V1 docs and OCR have anchors.', false, true),
-            $this->check('product.living_ops', 'Living ops started', ((int) ($counts['maintenance_items'] ?? 0) + (int) ($counts['wishlist_items'] ?? 0)) > 0, 'Add at least one maintenance item or need/want before V1 demo.', false, true),
+            $this->check('product.rooms_assets', 'Rooms/assets started', ((int) ($counts['rooms'] ?? 0) + (int) ($counts['assets'] ?? 0)) > 0, 'Add rooms or assets so records can be organized around the things in your home.', false, true),
+            $this->check('product.living_ops', 'Living ops started', ((int) ($counts['maintenance_items'] ?? 0) + (int) ($counts['wishlist_items'] ?? 0)) > 0, 'Add a maintenance item or need/want when you are ready to start tracking them.', false, true),
         ];
     }
 
@@ -158,21 +158,21 @@ class HomeOpsV0StatusController extends Controller
     {
         if ($blocked->isNotEmpty()) {
             return [
-                'headline' => 'V0 still has blockers.',
-                'body' => 'Fix the red checks before starting V1 OCR/documents/accounts. Most blockers are migration/context wiring issues.',
+                'headline' => 'Home setup needs attention.',
+                'body' => 'Complete the required setup items so each feature can use the correct property and records.',
             ];
         }
 
         if ($warning->isNotEmpty()) {
             return [
-                'headline' => 'V0 is structurally ready, but seed a little more real data.',
-                'body' => 'You can start V1 soon. Add rooms/assets, one spending period, or a maintenance item so V1 has useful anchors.',
+                'headline' => 'The essentials are ready. Add a little more real home data when convenient.',
+                'body' => 'Rooms, assets, spending periods, and maintenance items make the rest of HomeOps more useful.',
             ];
         }
 
         return [
-            'headline' => 'V0 checkpoint is ready.',
-            'body' => 'Home + Time + Records are in place. Next phase can start with Receipt OCR, Document Vault, Account Keeper, and richer reports.',
+            'headline' => 'Home setup is complete.',
+            'body' => 'Your property, time views, and records are connected and ready to use.',
         ];
     }
 
