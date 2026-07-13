@@ -247,6 +247,222 @@ class HomeOpsHomeController extends Controller
         return response()->json(['ok' => true, 'id' => $id], 201);
     }
 
+    public function storeSetup(Request $request)
+    {
+        $userId = HomeOpsV0::userId($request);
+
+        foreach (['homes', 'rooms', 'categories', 'vendors', 'bills', 'bill_instances', 'maintenance_items'] as $tableName) {
+            abort_unless(Schema::hasTable($tableName), 500, "Run the HomeOps migrations before starting property setup.");
+        }
+
+        $data = $request->validate([
+            'home' => ['required', 'array'],
+            'home.name' => ['required', 'string', 'max:160'],
+            'home.property_type' => ['required', 'string', 'max:80'],
+            'home.city_region' => ['nullable', 'string', 'max:160'],
+            'home.purchase_date' => ['nullable', 'date'],
+            'home.purchase_price' => ['nullable', 'numeric', 'min:0'],
+            'home.square_footage' => ['nullable', 'integer', 'min:0'],
+            'home.currency' => ['nullable', 'string', 'max:3'],
+            'home.mortgage_payment' => ['nullable', 'numeric', 'min:0'],
+            'home.hoa_fee' => ['nullable', 'numeric', 'min:0'],
+            'home.property_tax' => ['nullable', 'numeric', 'min:0'],
+            'home.insurance' => ['nullable', 'numeric', 'min:0'],
+            'home.utilities' => ['nullable', 'numeric', 'min:0'],
+            'home.internet' => ['nullable', 'numeric', 'min:0'],
+            'home.other_baseline_costs' => ['nullable', 'numeric', 'min:0'],
+            'home.occupancy_status' => ['nullable', 'string', 'max:80'],
+            'home.primary_use' => ['nullable', 'string', 'max:80'],
+            'home.is_primary' => ['nullable', 'boolean'],
+
+            'rooms' => ['required', 'array', 'min:2', 'max:30'],
+            'rooms.*.client_key' => ['required', 'string', 'max:100', 'distinct'],
+            'rooms.*.name' => ['required', 'string', 'max:120'],
+            'rooms.*.room_type' => ['nullable', 'string', 'max:80'],
+            'rooms.*.sort_order' => ['nullable', 'integer', 'min:0'],
+
+            'bills' => ['required', 'array', 'min:1', 'max:30'],
+            'bills.*.client_key' => ['required', 'string', 'max:100', 'distinct'],
+            'bills.*.source_key' => ['nullable', 'string', 'max:120'],
+            'bills.*.payee' => ['required', 'string', 'max:160'],
+            'bills.*.amount' => ['required', 'numeric', 'min:0.01'],
+            'bills.*.due_day' => ['required', 'integer', 'min:1', 'max:31'],
+            'bills.*.frequency' => ['required', Rule::in(['once', 'weekly', 'biweekly', 'monthly', 'quarterly', 'semiannual', 'annual'])],
+            'bills.*.month' => ['nullable', 'date'],
+            'bills.*.notes' => ['nullable', 'string'],
+
+            'maintenance' => ['required', 'array', 'min:1', 'max:30'],
+            'maintenance.*.client_key' => ['required', 'string', 'max:100', 'distinct'],
+            'maintenance.*.name' => ['required', 'string', 'max:180'],
+            'maintenance.*.room_key' => ['nullable', 'string', 'max:100'],
+            'maintenance.*.location_label' => ['nullable', 'string', 'max:160'],
+            'maintenance.*.frequency_count' => ['nullable', 'integer', 'min:1'],
+            'maintenance.*.frequency_unit' => ['required', Rule::in(['days', 'weeks', 'months', 'years', 'as_needed'])],
+            'maintenance.*.next_due_date' => ['nullable', 'date'],
+            'maintenance.*.priority' => ['required', Rule::in(['low', 'normal', 'high', 'urgent'])],
+            'maintenance.*.notes' => ['nullable', 'string'],
+            'maintenance.*.tracks_inventory' => ['nullable', 'boolean'],
+            'maintenance.*.quantity_on_hand' => ['nullable', 'integer', 'min:0'],
+            'maintenance.*.units_per_service' => ['nullable', 'integer', 'min:1'],
+            'maintenance.*.pack_quantity' => ['nullable', 'integer', 'min:1'],
+            'maintenance.*.restock_cost' => ['nullable', 'numeric', 'min:0'],
+            'maintenance.*.inventory_unit' => ['nullable', 'string', 'max:60'],
+        ]);
+
+        return DB::transaction(function () use ($data, $userId) {
+            $homeData = $data['home'];
+            $isFirstHome = !HomeOpsV0::homesForUser($userId)->exists();
+            $isPrimary = (bool) ($homeData['is_primary'] ?? $isFirstHome);
+
+            if ($isPrimary) {
+                DB::table('homes')->where('user_id', $userId)->update(['is_primary' => 0]);
+            }
+
+            $homeId = (int) DB::table('homes')->insertGetId(
+                $this->homeWritePayload($homeData, $userId, $isPrimary)
+            );
+            HomeOpsV0::attachHomeUser($userId, $homeId, 'owner');
+
+            $roomIds = [];
+            foreach ($data['rooms'] as $index => $room) {
+                $roomId = (int) DB::table('rooms')->insertGetId([
+                    'user_id' => $userId,
+                    'home_id' => $homeId,
+                    'name' => $room['name'],
+                    'room_type' => $room['room_type'] ?? null,
+                    'notes' => null,
+                    'sort_order' => $room['sort_order'] ?? (($index + 1) * 10),
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+                $roomIds[$room['client_key']] = $roomId;
+            }
+
+            $billCategoryId = $this->firstOrCreateCategory($userId, 'Bills', 'bill');
+            foreach ($data['bills'] as $bill) {
+                $vendorId = $this->firstOrCreateVendor($userId, $bill['payee'], 'payee', $billCategoryId);
+                $monthStart = Carbon::parse($bill['month'] ?? now()->format('Y-m-01'))->startOfMonth();
+                $dueDay = min((int) $bill['due_day'], (int) $monthStart->copy()->endOfMonth()->format('j'));
+                $dueDate = $monthStart->copy()->day($dueDay)->toDateString();
+
+                $billPayload = [
+                    'user_id' => $userId,
+                    'vendor_id' => $vendorId,
+                    'category_id' => $billCategoryId,
+                    'name' => $bill['payee'],
+                    'frequency' => $bill['frequency'],
+                    'expected_amount' => $bill['amount'],
+                    'variable_amount' => 0,
+                    'due_day' => $dueDay,
+                    'next_due_date' => $dueDate,
+                    'autopay' => 0,
+                    'status' => 'active',
+                    'notes' => $bill['notes'] ?? null,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
+
+                $coreSourceMap = [
+                    'mortgage' => 'mortgage_payment',
+                    'rent' => 'mortgage_payment',
+                    'hoa_fee' => 'hoa_fee',
+                    'property_tax' => 'property_tax',
+                    'insurance' => 'insurance',
+                    'utilities' => 'utilities',
+                    'internet' => 'internet',
+                ];
+                $requestedSourceKey = $bill['source_key'] ?? $bill['client_key'];
+                $coreSourceKey = $coreSourceMap[$requestedSourceKey] ?? null;
+
+                if (Schema::hasColumn('bills', 'source_type')) {
+                    $billPayload['source_type'] = $coreSourceKey ? 'home_baseline' : 'property_setup';
+                }
+                if (Schema::hasColumn('bills', 'source_key')) {
+                    $billPayload['source_key'] = $coreSourceKey ?: $requestedSourceKey;
+                }
+                if (Schema::hasColumn('bills', 'is_core_bill')) {
+                    $billPayload['is_core_bill'] = $coreSourceKey ? 1 : 0;
+                }
+
+                $billPayload = HomeOpsV0::addHomeId($billPayload, 'bills', $homeId);
+                $billId = (int) DB::table('bills')->insertGetId($billPayload);
+
+                $instancePayload = [
+                    'user_id' => $userId,
+                    'bill_id' => $billId,
+                    'period_month' => $monthStart->toDateString(),
+                    'due_date' => $dueDate,
+                    'expected_amount' => $bill['amount'],
+                    'status' => 'expected',
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
+                $instancePayload = HomeOpsV0::addHomeId($instancePayload, 'bill_instances', $homeId);
+                DB::table('bill_instances')->insert($instancePayload);
+            }
+
+            $maintenanceCategoryId = $this->firstOrCreateCategory($userId, 'Maintenance', 'maintenance');
+            foreach ($data['maintenance'] as $item) {
+                $roomId = !empty($item['room_key']) ? ($roomIds[$item['room_key']] ?? null) : null;
+                $maintenancePayload = [
+                    'user_id' => $userId,
+                    'category_id' => $maintenanceCategoryId,
+                    'name' => $item['name'],
+                    'location_label' => $item['location_label'] ?? null,
+                    'frequency_count' => $item['frequency_unit'] === 'as_needed' ? null : ($item['frequency_count'] ?? null),
+                    'frequency_unit' => $item['frequency_unit'],
+                    'next_due_date' => !empty($item['next_due_date']) ? Carbon::parse($item['next_due_date'])->toDateString() : null,
+                    'estimated_cost' => null,
+                    'priority' => $item['priority'],
+                    'status' => 'active',
+                    'instructions' => null,
+                    'notes' => $item['notes'] ?? null,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
+
+                if (Schema::hasColumn('maintenance_items', 'tracks_inventory')) {
+                    $tracksInventory = !empty($item['tracks_inventory']);
+                    $maintenancePayload['tracks_inventory'] = $tracksInventory ? 1 : 0;
+                    $maintenancePayload['quantity_on_hand'] = $tracksInventory ? (int) ($item['quantity_on_hand'] ?? 0) : 0;
+                    $maintenancePayload['units_per_service'] = $tracksInventory ? max(1, (int) ($item['units_per_service'] ?? 1)) : 1;
+                    $maintenancePayload['pack_quantity'] = $tracksInventory ? ($item['pack_quantity'] ?? null) : null;
+                    $maintenancePayload['restock_cost'] = $tracksInventory ? ($item['restock_cost'] ?? null) : null;
+                    $maintenancePayload['inventory_unit'] = $tracksInventory ? ($item['inventory_unit'] ?? null) : null;
+                }
+
+                $maintenancePayload = HomeOpsV0::addHomeId($maintenancePayload, 'maintenance_items', $homeId);
+                $maintenancePayload = HomeOpsV0::addRoomId($maintenancePayload, 'maintenance_items', $roomId);
+                $maintenancePayload = HomeOpsV0::addAssetId($maintenancePayload, 'maintenance_items', null);
+                DB::table('maintenance_items')->insert($maintenancePayload);
+            }
+
+            if (!empty($homeData['purchase_date']) && Schema::hasTable('ownership_events')) {
+                $isTenant = ($homeData['occupancy_status'] ?? null) === 'tenant';
+                DB::table('ownership_events')->insert([
+                    'user_id' => $userId,
+                    'home_id' => $homeId,
+                    'event_type' => $isTenant ? 'move_in' : 'purchase',
+                    'title' => $isTenant ? 'Move-in' : 'Purchase / closing',
+                    'event_date' => Carbon::parse($homeData['purchase_date'])->toDateString(),
+                    'description' => 'Added during property setup.',
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            }
+
+            return response()->json([
+                'ok' => true,
+                'home' => $this->homePayload($userId, $homeId),
+                'counts' => [
+                    'rooms' => count($data['rooms']),
+                    'bills' => count($data['bills']),
+                    'maintenance' => count($data['maintenance']),
+                ],
+            ], 201);
+        });
+    }
+
     private function validateHome(Request $request, bool $partial = false): array
     {
         $required = $partial ? 'sometimes' : 'required';
@@ -380,6 +596,49 @@ class HomeOpsHomeController extends Controller
         $exists = HomeOpsV0::userCanAccessHome($userId, $homeId);
 
         abort_unless($exists, 404, 'Home not found.');
+    }
+
+    private function firstOrCreateCategory(int $userId, string $name, string $type): int
+    {
+        $existingId = DB::table('categories')
+            ->where('user_id', $userId)
+            ->where('name', $name)
+            ->value('id');
+
+        if ($existingId) {
+            return (int) $existingId;
+        }
+
+        return (int) DB::table('categories')->insertGetId([
+            'user_id' => $userId,
+            'name' => $name,
+            'type' => $type,
+            'active' => 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+
+    private function firstOrCreateVendor(int $userId, string $name, string $vendorType, ?int $categoryId = null): int
+    {
+        $existingId = DB::table('vendors')
+            ->where('user_id', $userId)
+            ->where('name', $name)
+            ->value('id');
+
+        if ($existingId) {
+            return (int) $existingId;
+        }
+
+        return (int) DB::table('vendors')->insertGetId([
+            'user_id' => $userId,
+            'category_id' => $categoryId,
+            'name' => $name,
+            'vendor_type' => $vendorType,
+            'active' => 1,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
     }
 
     private function seedStarterRoomsAndAssets(int $userId, int $homeId): void

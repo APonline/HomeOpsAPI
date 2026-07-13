@@ -25,6 +25,7 @@ Route::prefix('homeops')->group(function () {
 
         Route::get('/homes', [HomeOpsHomeController::class, 'index']);
         Route::post('/homes', [HomeOpsHomeController::class, 'store']);
+        Route::post('/property-setup', [HomeOpsHomeController::class, 'storeSetup']);
         Route::get('/homes/{homeId}', [HomeOpsHomeController::class, 'show']);
         Route::patch('/homes/{homeId}', [HomeOpsHomeController::class, 'update']);
         Route::get('/homes/{homeId}/rooms', [HomeOpsHomeController::class, 'rooms']);

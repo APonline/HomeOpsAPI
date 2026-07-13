@@ -51,6 +51,7 @@ class HomeOpsCoreBillsController extends Controller
             $billIds = [];
 
             foreach ($this->coreMap() as $item) {
+                $item = $this->adaptCoreItemForHome($home, $item);
                 $amount = $this->amountFromHome($home, $item['key']);
 
                 if ($amount === null || $amount <= 0) {
@@ -104,6 +105,7 @@ class HomeOpsCoreBillsController extends Controller
     private function coreItems(object $home, int $userId, int $homeId): array
     {
         return collect($this->coreMap())->map(function ($item) use ($home, $userId, $homeId) {
+            $item = $this->adaptCoreItemForHome($home, $item);
             $amount = $this->amountFromHome($home, $item['key']);
             $bill = $this->findLinkedBill($userId, $homeId, $item);
 
@@ -165,6 +167,35 @@ class HomeOpsCoreBillsController extends Controller
         ];
     }
 
+    private function adaptCoreItemForHome(object $home, array $item): array
+    {
+        if (($item['key'] ?? null) !== 'mortgage_payment') {
+            return $item;
+        }
+
+        $occupancy = strtolower(trim((string) ($home->occupancy_status ?? '')));
+        $primaryUse = strtolower(trim((string) ($home->primary_use ?? '')));
+
+        $isRental = in_array($occupancy, [
+            'rent',
+            'rental',
+            'renter',
+            'tenant',
+            'renting',
+            'leased',
+        ], true) || in_array($primaryUse, ['rental', 'tenant'], true);
+
+        if ($isRental) {
+            $item['label'] = 'Rent';
+            $item['aliases'] = array_values(array_unique(array_merge(
+                $item['aliases'] ?? [],
+                ['Rent', 'Monthly Rent', 'Rental Payment']
+            )));
+        }
+
+        return $item;
+    }
+
     private function amountFromHome(object $home, string $key): ?float
     {
         if (!property_exists($home, $key) || $home->{$key} === null || $home->{$key} === '') {
@@ -180,7 +211,7 @@ class HomeOpsCoreBillsController extends Controller
             ->where('user_id', $userId)
             ->where('source_type', 'home_baseline')
             ->where('source_key', $item['key'])
-            ->orderByRaw("FIELD(status, 'active') DESC")
+            ->orderByRaw("CASE WHEN status = 'active' THEN 0 ELSE 1 END")
             ->orderBy('id');
         HomeOpsV0::unqualifiedHomeFilter($sourceQuery, 'bills', $homeId);
 
@@ -193,7 +224,7 @@ class HomeOpsCoreBillsController extends Controller
         $aliasQuery = DB::table('bills')
             ->where('user_id', $userId)
             ->whereIn('name', $item['aliases'])
-            ->orderByRaw("FIELD(status, 'active') DESC")
+            ->orderByRaw("CASE WHEN status = 'active' THEN 0 ELSE 1 END")
             ->orderBy('id');
         HomeOpsV0::unqualifiedHomeFilter($aliasQuery, 'bills', $homeId);
 

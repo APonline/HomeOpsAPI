@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Support\HomeOpsBillEngine;
+use App\Support\HomeOpsSchemaRepair;
 use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -17,7 +18,7 @@ class HomeOpsV1Controller extends Controller
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
 
-        if (!Schema::hasTable('financial_accounts')) {
+        if (!$this->financialSchemaReady()) {
             return response()->json([
                 'home' => HomeOpsV0::homeSummary($homeId),
                 'accounts' => [],
@@ -28,24 +29,8 @@ class HomeOpsV1Controller extends Controller
                     'scheduled_monthly_payments' => 0,
                 ],
                 'schema_ready' => false,
-            ]);
-        }
-
-        $columns = array_fill_keys(Schema::getColumnListing('financial_accounts'), true);
-        $required = ['id', 'user_id', 'name', 'account_type', 'current_balance', 'status'];
-
-        if (array_diff($required, array_keys($columns)) !== []) {
-            return response()->json([
-                'home' => HomeOpsV0::homeSummary($homeId),
-                'accounts' => [],
-                'summary' => [
-                    'debt_total' => 0,
-                    'asset_total' => 0,
-                    'net_position' => 0,
-                    'scheduled_monthly_payments' => 0,
-                ],
-                'schema_ready' => false,
-            ]);
+                'message' => 'Financing could not initialize. Run php artisan homeops:repair-schema --no-sync on the API.',
+            ], 503);
         }
 
         $query = DB::table('financial_accounts')
@@ -92,7 +77,7 @@ class HomeOpsV1Controller extends Controller
 
     public function storeFinancialAccount(Request $request)
     {
-        abort_unless(Schema::hasTable('financial_accounts'), 503, 'Financing is temporarily unavailable.');
+        abort_unless($this->financialSchemaReady(), 503, 'Financing could not initialize. Run php artisan homeops:repair-schema --no-sync on the API.');
 
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
@@ -109,7 +94,7 @@ class HomeOpsV1Controller extends Controller
 
     public function updateFinancialAccount(Request $request, int $accountId)
     {
-        abort_unless(Schema::hasTable('financial_accounts'), 503, 'Financing is temporarily unavailable.');
+        abort_unless($this->financialSchemaReady(), 503, 'Financing could not initialize. Run php artisan homeops:repair-schema --no-sync on the API.');
 
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
@@ -126,7 +111,7 @@ class HomeOpsV1Controller extends Controller
 
     public function deleteFinancialAccount(Request $request, int $accountId)
     {
-        abort_unless(Schema::hasTable('financial_accounts'), 503, 'Financing is temporarily unavailable.');
+        abort_unless($this->financialSchemaReady(), 503, 'Financing could not initialize. Run php artisan homeops:repair-schema --no-sync on the API.');
 
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
@@ -343,10 +328,61 @@ class HomeOpsV1Controller extends Controller
         ]);
     }
 
+    private function financialSchemaReady(): bool
+    {
+        $required = ['id', 'user_id', 'name', 'account_type', 'current_balance', 'status'];
+
+        $isReady = static function () use ($required): bool {
+            if (!Schema::hasTable('financial_accounts')) {
+                return false;
+            }
+
+            $columns = array_fill_keys(Schema::getColumnListing('financial_accounts'), true);
+            return array_diff($required, array_keys($columns)) === [];
+        };
+
+        if ($isReady()) {
+            return true;
+        }
+
+        try {
+            HomeOpsSchemaRepair::ensureFinancialAccountsTable();
+        } catch (\Throwable $exception) {
+            report($exception);
+            return false;
+        }
+
+        return $isReady();
+    }
+
+    private function financialAccountName(array $data): string
+    {
+        $provided = trim((string) ($data['name'] ?? ''));
+        if ($provided !== '') {
+            return $provided;
+        }
+
+        $labels = [
+            'mortgage' => 'Mortgage',
+            'line_of_credit' => 'Line of Credit',
+            'credit_card' => 'Credit Card',
+            'loan' => 'Loan',
+            'savings' => 'Savings',
+            'chequing' => 'Chequing',
+            'investment' => 'Investment',
+            'other' => 'Account',
+        ];
+
+        $institution = trim((string) ($data['institution'] ?? ''));
+        $type = $labels[$data['account_type'] ?? 'other'] ?? 'Account';
+
+        return trim($institution . ' ' . $type);
+    }
+
     private function validateFinancialAccount(Request $request): array
     {
         return $request->validate([
-            'name' => ['required', 'string', 'max:160'],
+            'name' => ['nullable', 'string', 'max:160'],
             'account_type' => ['required', Rule::in(['mortgage', 'line_of_credit', 'credit_card', 'loan', 'savings', 'chequing', 'investment', 'other'])],
             'institution' => ['nullable', 'string', 'max:160'],
             'current_balance' => ['required', 'numeric', 'min:0'],
@@ -364,7 +400,7 @@ class HomeOpsV1Controller extends Controller
     private function financialPayload(array $data, int $userId, ?int $homeId, bool $includeOwner = true): array
     {
         $candidate = [
-            'name' => $data['name'],
+            'name' => $this->financialAccountName($data),
             'account_type' => $data['account_type'],
             'institution' => $data['institution'] ?? null,
             'current_balance' => $data['current_balance'],

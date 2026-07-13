@@ -31,6 +31,19 @@ class HomeOpsSchemaRepair
         return $changes;
     }
 
+    /**
+     * Ensure only the financing table required by the Financing screen.
+     *
+     * @return array<int, string>
+     */
+    public static function ensureFinancialAccountsTable(): array
+    {
+        $changes = [];
+        self::ensureFinancialAccounts($changes);
+
+        return $changes;
+    }
+
     /** @param array<int, string> $changes */
     private static function ensureFinancialAccounts(array &$changes): void
     {
