@@ -223,7 +223,15 @@ class HomeOpsCoreBillsController extends Controller
 
         $aliasQuery = DB::table('bills')
             ->where('user_id', $userId)
-            ->whereIn('name', $item['aliases'])
+            ->whereIn('name', $item['aliases']);
+
+        if (Schema::hasColumn('bills', 'bill_type')) {
+            $aliasQuery->where(function ($query) {
+                $query->whereNull('bill_type')->orWhere('bill_type', 'core');
+            });
+        }
+
+        $aliasQuery
             ->orderByRaw("CASE WHEN status = 'active' THEN 0 ELSE 1 END")
             ->orderBy('id');
         HomeOpsV0::unqualifiedHomeFilter($aliasQuery, 'bills', $homeId);
@@ -249,6 +257,9 @@ class HomeOpsCoreBillsController extends Controller
 
         if (!$bill->notes) {
             $payload['notes'] = 'Core ownership bill synced from Property Profile baseline.';
+        }
+        if (Schema::hasColumn('bills', 'bill_type')) {
+            $payload['bill_type'] = 'core';
         }
 
         DB::table('bills')
@@ -277,6 +288,9 @@ class HomeOpsCoreBillsController extends Controller
             'created_at' => now(),
             'updated_at' => now(),
         ];
+        if (Schema::hasColumn('bills', 'bill_type')) {
+            $payload['bill_type'] = 'core';
+        }
         $payload = HomeOpsV0::addHomeId($payload, 'bills', $homeId);
 
         return (int) DB::table('bills')->insertGetId($payload);
@@ -293,7 +307,10 @@ class HomeOpsCoreBillsController extends Controller
         $instance = $instanceQuery->first();
 
         if ($instance) {
-            if (!in_array($instance->status, ['paid', 'cleared'], true)) {
+            $isManualOverride = Schema::hasColumn('bill_instances', 'is_manual_override')
+                && (bool) ($instance->is_manual_override ?? false);
+
+            if (!in_array($instance->status, ['paid', 'cleared'], true) && !$isManualOverride) {
                 DB::table('bill_instances')
                     ->where('id', $instance->id)
                     ->update([
@@ -316,6 +333,9 @@ class HomeOpsCoreBillsController extends Controller
             'created_at' => now(),
             'updated_at' => now(),
         ];
+        if (Schema::hasColumn('bill_instances', 'is_manual_override')) {
+            $payload['is_manual_override'] = 0;
+        }
         $payload = HomeOpsV0::addHomeId($payload, 'bill_instances', $homeId);
 
         DB::table('bill_instances')->insert($payload);

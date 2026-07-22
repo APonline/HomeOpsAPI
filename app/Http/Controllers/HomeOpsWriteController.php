@@ -22,12 +22,14 @@ class HomeOpsWriteController extends Controller
             'payee' => ['required', 'string', 'max:160'],
             'amount' => ['nullable', 'numeric', 'min:0'],
             'due_day' => ['nullable', 'integer', 'min:1', 'max:31'],
+            'bill_type' => ['nullable', Rule::in(['core', 'recurring', 'one_time'])],
             'frequency' => ['required', Rule::in(['once', 'weekly', 'biweekly', 'monthly', 'quarterly', 'semiannual', 'annual'])],
             'month' => ['nullable', 'date'],
             'notes' => ['nullable', 'string'],
         ]);
 
         return DB::transaction(function () use ($data, $userId, $homeId) {
+            $billType = $this->normalizeBillType($data['bill_type'] ?? null, $data['frequency']);
             $vendorId = $this->firstOrCreateVendor($userId, $data['payee'], 'payee');
             $categoryId = $this->firstOrCreateCategory($userId, 'Bills', 'bill');
 
@@ -46,7 +48,7 @@ class HomeOpsWriteController extends Controller
                 'name' => $data['payee'],
                 'frequency' => $data['frequency'],
                 'expected_amount' => $data['amount'] ?? null,
-                'variable_amount' => empty($data['amount']) ? 1 : 0,
+                'variable_amount' => $data['amount'] === null ? 1 : 0,
                 'due_day' => $data['due_day'] ?? null,
                 'next_due_date' => $dueDate,
                 'autopay' => 0,
@@ -55,6 +57,14 @@ class HomeOpsWriteController extends Controller
                 'created_at' => now(),
                 'updated_at' => now(),
             ];
+
+            if (Schema::hasColumn('bills', 'bill_type')) {
+                $billPayload['bill_type'] = $billType;
+            }
+            if (Schema::hasColumn('bills', 'is_core_bill')) {
+                $billPayload['is_core_bill'] = $billType === 'core' ? 1 : 0;
+            }
+
             $billPayload = HomeOpsV0::addHomeId($billPayload, 'bills', $homeId);
 
             $billId = DB::table('bills')->insertGetId($billPayload);
@@ -70,6 +80,9 @@ class HomeOpsWriteController extends Controller
                     'created_at' => now(),
                     'updated_at' => now(),
                 ];
+                if (Schema::hasColumn('bill_instances', 'is_manual_override')) {
+                    $instancePayload['is_manual_override'] = 0;
+                }
                 $instancePayload = HomeOpsV0::addHomeId($instancePayload, 'bill_instances', $homeId);
                 DB::table('bill_instances')->insertOrIgnore($instancePayload);
             }
@@ -92,12 +105,14 @@ class HomeOpsWriteController extends Controller
             'payee' => ['required', 'string', 'max:160'],
             'amount' => ['nullable', 'numeric', 'min:0'],
             'due_day' => ['nullable', 'integer', 'min:1', 'max:31'],
+            'bill_type' => ['nullable', Rule::in(['core', 'recurring', 'one_time'])],
             'frequency' => ['required', Rule::in(['once', 'weekly', 'biweekly', 'monthly', 'quarterly', 'semiannual', 'annual'])],
             'month' => ['nullable', 'date'],
             'notes' => ['nullable', 'string'],
         ]);
 
         return DB::transaction(function () use ($data, $userId, $billId, $homeId) {
+            $billType = $this->normalizeBillType($data['bill_type'] ?? null, $data['frequency']);
             $billQuery = DB::table('bills')
                 ->where('user_id', $userId)
                 ->where('id', $billId);
@@ -124,18 +139,38 @@ class HomeOpsWriteController extends Controller
                 'name' => $data['payee'],
                 'frequency' => $data['frequency'],
                 'expected_amount' => $data['amount'] ?? null,
-                'variable_amount' => empty($data['amount']) ? 1 : 0,
+                'variable_amount' => $data['amount'] === null ? 1 : 0,
                 'due_day' => $data['due_day'] ?? null,
                 'next_due_date' => $dueDate,
                 'notes' => $data['notes'] ?? null,
                 'updated_at' => now(),
             ];
+
+            if (Schema::hasColumn('bills', 'bill_type')) {
+                $updatePayload['bill_type'] = $billType;
+            }
+            if (Schema::hasColumn('bills', 'is_core_bill')) {
+                $updatePayload['is_core_bill'] = $billType === 'core' ? 1 : 0;
+            }
+            if ($billType !== 'core') {
+                if (Schema::hasColumn('bills', 'source_type')) {
+                    $updatePayload['source_type'] = null;
+                }
+                if (Schema::hasColumn('bills', 'source_key')) {
+                    $updatePayload['source_key'] = null;
+                }
+            }
+
             $updatePayload = HomeOpsV0::addHomeId($updatePayload, 'bills', $homeId);
 
             DB::table('bills')
                 ->where('user_id', $userId)
                 ->where('id', $billId)
                 ->update($updatePayload);
+
+            if ($billType === 'core') {
+                $this->syncHomeBaselineAmount($bill, $homeId, $data['amount'] ?? null);
+            }
 
             $instanceQuery = DB::table('bill_instances')
                 ->where('user_id', $userId)
@@ -145,13 +180,19 @@ class HomeOpsWriteController extends Controller
             $instance = $instanceQuery->first();
 
             if ($instance && !in_array($instance->status, ['paid', 'cleared'], true)) {
+                $instanceUpdate = [
+                    'due_date' => $dueDate,
+                    'expected_amount' => $data['amount'] ?? null,
+                    'updated_at' => now(),
+                ];
+                if (Schema::hasColumn('bill_instances', 'is_manual_override')) {
+                    $instanceUpdate['is_manual_override'] = 0;
+                }
+
                 DB::table('bill_instances')
+                    ->where('user_id', $userId)
                     ->where('id', $instance->id)
-                    ->update([
-                        'due_date' => $dueDate,
-                        'expected_amount' => $data['amount'] ?? null,
-                        'updated_at' => now(),
-                    ]);
+                    ->update($instanceUpdate);
             } elseif (!$instance && $dueDate) {
                 $instancePayload = [
                     'user_id' => $userId,
@@ -163,6 +204,9 @@ class HomeOpsWriteController extends Controller
                     'created_at' => now(),
                     'updated_at' => now(),
                 ];
+                if (Schema::hasColumn('bill_instances', 'is_manual_override')) {
+                    $instancePayload['is_manual_override'] = 0;
+                }
                 $instancePayload = HomeOpsV0::addHomeId($instancePayload, 'bill_instances', $homeId);
                 DB::table('bill_instances')->insert($instancePayload);
             }
@@ -170,6 +214,7 @@ class HomeOpsWriteController extends Controller
             return response()->json([
                 'ok' => true,
                 'id' => $billId,
+                'bill_type' => $billType,
                 'message' => 'Bill updated.',
             ]);
         });
@@ -189,12 +234,21 @@ class HomeOpsWriteController extends Controller
 
             abort_if(!$bill, 404, 'Bill not found.');
 
-            $instances = DB::table('bill_instances')
+            $instancesQuery = DB::table('bill_instances')
                 ->where('user_id', $userId)
                 ->where('bill_id', $billId)
                 ->whereNotIn('status', ['paid', 'cleared']);
-            HomeOpsV0::unqualifiedHomeFilter($instances, 'bill_instances', $homeId);
-            $instances->delete();
+            HomeOpsV0::unqualifiedHomeFilter($instancesQuery, 'bill_instances', $homeId);
+            $instanceIds = $instancesQuery->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+            $this->deleteLedgerEntriesForBillInstances($userId, $instanceIds);
+
+            if ($instanceIds) {
+                DB::table('bill_instances')
+                    ->where('user_id', $userId)
+                    ->whereIn('id', $instanceIds)
+                    ->delete();
+            }
 
             DB::table('bills')
                 ->where('user_id', $userId)
@@ -237,7 +291,6 @@ class HomeOpsWriteController extends Controller
             $monthStart = Carbon::parse($data['month'] ?? now()->format('Y-m-01'))->startOfMonth();
             $monthEnd = $monthStart->copy()->endOfMonth();
             $paidAt = Carbon::parse($data['paid_at'] ?? $data['paid_date'] ?? now()->toDateString())->toDateString();
-            $amount = $data['amount'] ?? $bill->expected_amount ?? 0;
 
             $dueDate = $bill->next_due_date;
 
@@ -247,13 +300,19 @@ class HomeOpsWriteController extends Controller
             }
 
             $existingInstanceQuery = DB::table('bill_instances')
+                ->where('user_id', $userId)
                 ->where('bill_id', $billId)
                 ->where('period_month', $monthStart->toDateString());
             HomeOpsV0::unqualifiedHomeFilter($existingInstanceQuery, 'bill_instances', $homeId);
             $existingInstance = $existingInstanceQuery->first();
+            $amount = $data['amount']
+                ?? $existingInstance?->expected_amount
+                ?? $bill->expected_amount
+                ?? 0;
 
             if ($existingInstance) {
                 DB::table('bill_instances')
+                    ->where('user_id', $userId)
                     ->where('id', $existingInstance->id)
                     ->update([
                         'actual_amount' => $amount,
@@ -276,6 +335,9 @@ class HomeOpsWriteController extends Controller
                     'created_at' => now(),
                     'updated_at' => now(),
                 ];
+                if (Schema::hasColumn('bill_instances', 'is_manual_override')) {
+                    $instancePayload['is_manual_override'] = 0;
+                }
                 $instancePayload = HomeOpsV0::addHomeId($instancePayload, 'bill_instances', $homeId);
                 $instanceId = DB::table('bill_instances')->insertGetId($instancePayload);
             }
@@ -367,15 +429,54 @@ class HomeOpsWriteController extends Controller
             $payload['paid_at'] = Carbon::parse($data['paid_at'])->toDateString();
         }
 
-        DB::table('bill_instances')
-            ->where('id', $instanceId)
-            ->update($payload);
+        if (
+            Schema::hasColumn('bill_instances', 'is_manual_override')
+            && (array_key_exists('expected_amount', $data) || array_key_exists('due_date', $data))
+        ) {
+            $payload['is_manual_override'] = 1;
+        }
 
-        return response()->json([
-            'ok' => true,
-            'id' => $instanceId,
-            'message' => 'This month was updated.',
-        ]);
+        return DB::transaction(function () use ($userId, $homeId, $instanceId, $instance, $data, $payload) {
+            $isPaidInstance = in_array((string) $instance->status, ['paid', 'cleared'], true);
+            $amountWasEdited = array_key_exists('expected_amount', $data);
+
+            // A paid month is displayed from actual_amount. When the user edits
+            // that month's amount, keep the visible row, monthly totals, and the
+            // linked payment transaction in sync instead of leaving the old paid
+            // amount on screen.
+            if ($isPaidInstance && $amountWasEdited && $data['expected_amount'] !== null && !array_key_exists('actual_amount', $data)) {
+                $payload['actual_amount'] = $data['expected_amount'];
+            }
+
+            $updateQuery = DB::table('bill_instances')
+                ->where('user_id', $userId)
+                ->where('id', $instanceId);
+            HomeOpsV0::unqualifiedHomeFilter($updateQuery, 'bill_instances', $homeId);
+            $updateQuery->update($payload);
+
+            if ($isPaidInstance && array_key_exists('actual_amount', $payload)) {
+                $ledgerQuery = DB::table('ledger_entries')
+                    ->where('user_id', $userId)
+                    ->where('bill_instance_id', $instanceId)
+                    ->where('entry_type', 'bill_payment');
+                HomeOpsV0::unqualifiedHomeFilter($ledgerQuery, 'ledger_entries', $homeId);
+                $ledgerQuery->update([
+                    'total_amount' => $payload['actual_amount'],
+                    'updated_at' => now(),
+                ]);
+            }
+
+            return response()->json([
+                'ok' => true,
+                'id' => $instanceId,
+                'expected_amount' => $payload['expected_amount'] ?? $instance->expected_amount,
+                'actual_amount' => array_key_exists('actual_amount', $payload)
+                    ? $payload['actual_amount']
+                    : $instance->actual_amount,
+                'due_date' => $payload['due_date'] ?? $instance->due_date,
+                'message' => 'This month was updated.',
+            ]);
+        });
     }
 
     public function skipBillForMonth(Request $request, int $billId)
@@ -402,10 +503,7 @@ class HomeOpsWriteController extends Controller
                 'updated_at' => now(),
             ]);
 
-        DB::table('ledger_entries')
-            ->where('user_id', $userId)
-            ->where('bill_instance_id', $instance->id)
-            ->delete();
+        $this->deleteLedgerEntriesForBillInstances($userId, [(int) $instance->id]);
 
         return response()->json([
             'ok' => true,
@@ -438,10 +536,7 @@ class HomeOpsWriteController extends Controller
                 'updated_at' => now(),
             ]);
 
-        DB::table('ledger_entries')
-            ->where('user_id', $userId)
-            ->where('bill_instance_id', $instance->id)
-            ->delete();
+        $this->deleteLedgerEntriesForBillInstances($userId, [(int) $instance->id]);
 
         return response()->json([
             'ok' => true,
@@ -889,6 +984,48 @@ class HomeOpsWriteController extends Controller
         return response()->json(['ok' => true]);
     }
 
+    /**
+     * Remove payment-ledger rows and their pivot links before deleting/resetting
+     * bill instances. This keeps older databases with restrictive foreign keys
+     * from rejecting otherwise valid bill actions.
+     *
+     * @param array<int, int> $instanceIds
+     */
+    private function deleteLedgerEntriesForBillInstances(int $userId, array $instanceIds): void
+    {
+        if (!$instanceIds || !Schema::hasTable('ledger_entries')) {
+            return;
+        }
+
+        $ledgerIds = DB::table('ledger_entries')
+            ->where('user_id', $userId)
+            ->whereIn('bill_instance_id', $instanceIds)
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        if (!$ledgerIds) {
+            return;
+        }
+
+        if (Schema::hasTable('period_ledger_entries')) {
+            DB::table('period_ledger_entries')
+                ->whereIn('ledger_entry_id', $ledgerIds)
+                ->delete();
+        }
+
+        if (Schema::hasTable('receipts') && Schema::hasColumn('receipts', 'ledger_entry_id')) {
+            DB::table('receipts')
+                ->whereIn('ledger_entry_id', $ledgerIds)
+                ->update(['ledger_entry_id' => null]);
+        }
+
+        DB::table('ledger_entries')
+            ->where('user_id', $userId)
+            ->whereIn('id', $ledgerIds)
+            ->delete();
+    }
+
     private function resolveRoomId(int $userId, ?int $homeId, mixed $roomId): ?int
     {
         if (!$roomId || !$homeId || !Schema::hasTable('rooms')) {
@@ -925,6 +1062,50 @@ class HomeOpsWriteController extends Controller
             'created_at' => now(),
             'updated_at' => now(),
         ]);
+    }
+
+    private function normalizeBillType(?string $billType, string $frequency): string
+    {
+        $normalized = strtolower(str_replace('-', '_', trim((string) $billType)));
+
+        if (in_array($normalized, ['core', 'recurring', 'one_time'], true)) {
+            return $normalized;
+        }
+
+        return strtolower($frequency) === 'once' ? 'one_time' : 'recurring';
+    }
+
+    private function syncHomeBaselineAmount(object $bill, ?int $homeId, ?float $amount): void
+    {
+        if (!$homeId || $amount === null || !Schema::hasTable('homes')) {
+            return;
+        }
+
+        $sourceType = (string) ($bill->source_type ?? '');
+        $sourceKey = (string) ($bill->source_key ?? '');
+        $allowedKeys = [
+            'mortgage_payment',
+            'hoa_fee',
+            'property_tax',
+            'insurance',
+            'utilities',
+            'internet',
+        ];
+
+        if ($sourceType !== 'home_baseline' || !in_array($sourceKey, $allowedKeys, true)) {
+            return;
+        }
+
+        if (!Schema::hasColumn('homes', $sourceKey)) {
+            return;
+        }
+
+        DB::table('homes')
+            ->where('id', $homeId)
+            ->update([
+                $sourceKey => round($amount, 2),
+                'updated_at' => now(),
+            ]);
     }
 
     private function firstOrCreateVendor(int $userId, string $name, string $vendorType, ?int $categoryId = null): int

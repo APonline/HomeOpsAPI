@@ -7,6 +7,7 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 
 class HomeOpsHomeController extends Controller
@@ -108,6 +109,129 @@ class HomeOpsHomeController extends Controller
         });
     }
 
+    public function destroy(Request $request, int $homeId)
+    {
+        $userId = HomeOpsV0::userId($request);
+
+        $home = Schema::hasTable('homes')
+            ? DB::table('homes')->where('id', $homeId)->first()
+            : null;
+
+        abort_if(!$home || !HomeOpsV0::userCanAccessHome($userId, $homeId), 404, 'Property not found.');
+
+        $accessiblePropertyCount = HomeOpsV0::homesForUser($userId)->count();
+
+        abort_if(
+            $accessiblePropertyCount <= 1,
+            422,
+            'Create another property before removing your only property.'
+        );
+
+        $isOwner = (int) $home->user_id === $userId;
+
+        if (!$isOwner) {
+            abort_unless(Schema::hasTable('property_users'), 403, 'This property access cannot be removed.');
+
+            DB::table('property_users')
+                ->where('home_id', $homeId)
+                ->where('user_id', $userId)
+                ->delete();
+
+            return response()->json([
+                'ok' => true,
+                'detached' => true,
+                'removed_home_id' => $homeId,
+            ]);
+        }
+
+        $storedDocuments = $this->storedDocumentsForHome($homeId);
+        $wasPrimary = (bool) $home->is_primary;
+
+        $nextHomeId = DB::transaction(function () use ($homeId, $userId, $wasPrimary) {
+            $periodIds = $this->idsForHome('spending_periods', $homeId);
+            $ledgerEntryIds = $this->idsForHome('ledger_entries', $homeId);
+
+            if (Schema::hasTable('period_ledger_entries')) {
+                DB::table('period_ledger_entries')
+                    ->when(
+                        $periodIds->isNotEmpty() && $ledgerEntryIds->isNotEmpty(),
+                        fn ($query) => $query->where(function ($nested) use ($periodIds, $ledgerEntryIds) {
+                            $nested->whereIn('spending_period_id', $periodIds)
+                                ->orWhereIn('ledger_entry_id', $ledgerEntryIds);
+                        }),
+                        fn ($query) => $periodIds->isNotEmpty()
+                            ? $query->whereIn('spending_period_id', $periodIds)
+                            : $query->whereIn('ledger_entry_id', $ledgerEntryIds)
+                    )
+                    ->delete();
+            }
+
+            foreach ([
+                'maintenance_logs',
+                'receipts',
+                'documents',
+                'wishlist_items',
+                'ledger_entries',
+                'bill_instances',
+                'bills',
+                'maintenance_items',
+                'spending_periods',
+                'budget_profiles',
+                'financial_accounts',
+                'service_contacts',
+                'ownership_events',
+                'home_photos',
+                'home_assets',
+                'rooms',
+            ] as $tableName) {
+                $this->deleteRowsForHome($tableName, $homeId);
+            }
+
+            if (Schema::hasTable('property_users')) {
+                DB::table('property_users')->where('home_id', $homeId)->delete();
+            }
+
+            DB::table('homes')
+                ->where('id', $homeId)
+                ->where('user_id', $userId)
+                ->delete();
+
+            $nextOwnedHomeId = DB::table('homes')
+                ->where('user_id', $userId)
+                ->orderByDesc('is_primary')
+                ->orderBy('id')
+                ->value('id');
+
+            if ($wasPrimary && $nextOwnedHomeId) {
+                DB::table('homes')
+                    ->where('user_id', $userId)
+                    ->update(['is_primary' => 0]);
+
+                DB::table('homes')
+                    ->where('id', $nextOwnedHomeId)
+                    ->where('user_id', $userId)
+                    ->update(['is_primary' => 1]);
+            }
+
+            return $nextOwnedHomeId ? (int) $nextOwnedHomeId : null;
+        });
+
+        foreach ($storedDocuments as $document) {
+            try {
+                Storage::disk($document->storage_disk ?: 'local')->delete($document->file_path);
+            } catch (\Throwable $error) {
+                report($error);
+            }
+        }
+
+        return response()->json([
+            'ok' => true,
+            'deleted' => true,
+            'removed_home_id' => $homeId,
+            'next_home_id' => $nextHomeId,
+        ]);
+    }
+
     public function rooms(Request $request, int $homeId)
     {
         $userId = HomeOpsV0::userId($request);
@@ -149,6 +273,61 @@ class HomeOpsHomeController extends Controller
         return response()->json(['ok' => true, 'id' => $id], 201);
     }
 
+    public function updateRoom(Request $request, int $homeId, int $roomId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $this->abortUnlessHome($userId, $homeId);
+
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:120'],
+            'room_type' => ['nullable', 'string', 'max:80'],
+            'notes' => ['nullable', 'string'],
+            'sort_order' => ['nullable', 'integer', 'min:0'],
+        ]);
+
+        $room = DB::table('rooms')
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->where('id', $roomId)
+            ->first();
+
+        abort_if(!$room, 404, 'Room not found.');
+
+        DB::table('rooms')->where('id', $roomId)->update([
+            'name' => $data['name'],
+            'room_type' => $data['room_type'] ?? null,
+            'notes' => $data['notes'] ?? null,
+            'sort_order' => $data['sort_order'] ?? $room->sort_order,
+            'updated_at' => now(),
+        ]);
+
+        return response()->json(['ok' => true, 'id' => $roomId]);
+    }
+
+    public function deleteRoom(Request $request, int $homeId, int $roomId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $this->abortUnlessHome($userId, $homeId);
+
+        $exists = DB::table('rooms')
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->where('id', $roomId)
+            ->exists();
+
+        abort_if(!$exists, 404, 'Room not found.');
+
+        DB::transaction(function () use ($roomId) {
+            foreach (['home_assets', 'wishlist_items', 'ledger_entries', 'receipts', 'maintenance_items', 'documents'] as $table) {
+                $this->clearContextReference($table, 'room_id', $roomId);
+            }
+
+            DB::table('rooms')->where('id', $roomId)->delete();
+        });
+
+        return response()->json(['ok' => true]);
+    }
+
     public function assets(Request $request, int $homeId)
     {
         $userId = HomeOpsV0::userId($request);
@@ -185,10 +364,12 @@ class HomeOpsHomeController extends Controller
             'notes' => ['nullable', 'string'],
         ]);
 
+        $roomId = $this->resolveOwnedRoomId($userId, $homeId, $data['room_id'] ?? null);
+
         $id = DB::table('home_assets')->insertGetId([
             'user_id' => $userId,
             'home_id' => $homeId,
-            'room_id' => $data['room_id'] ?? null,
+            'room_id' => $roomId,
             'name' => $data['name'],
             'asset_type' => $data['asset_type'] ?? 'general',
             'brand' => $data['brand'] ?? null,
@@ -203,6 +384,79 @@ class HomeOpsHomeController extends Controller
         ]);
 
         return response()->json(['ok' => true, 'id' => $id], 201);
+    }
+
+    public function updateAsset(Request $request, int $homeId, int $assetId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $this->abortUnlessHome($userId, $homeId);
+
+        $data = $request->validate([
+            'room_id' => ['nullable', 'integer'],
+            'name' => ['required', 'string', 'max:160'],
+            'asset_type' => ['nullable', 'string', 'max:100'],
+            'brand' => ['nullable', 'string', 'max:120'],
+            'model' => ['nullable', 'string', 'max:120'],
+            'serial_number' => ['nullable', 'string', 'max:160'],
+            'installed_on' => ['nullable', 'date'],
+            'warranty_expires_on' => ['nullable', 'date'],
+            'notes' => ['nullable', 'string'],
+        ]);
+
+        $asset = DB::table('home_assets')
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->where('id', $assetId)
+            ->first();
+
+        abort_if(!$asset, 404, 'Asset not found.');
+
+        $roomId = $this->resolveOwnedRoomId($userId, $homeId, $data['room_id'] ?? null);
+
+        DB::table('home_assets')->where('id', $assetId)->update([
+            'room_id' => $roomId,
+            'name' => $data['name'],
+            'asset_type' => $data['asset_type'] ?? ($asset->asset_type ?: 'general'),
+            'brand' => array_key_exists('brand', $data) ? ($data['brand'] ?: null) : $asset->brand,
+            'model' => array_key_exists('model', $data) ? ($data['model'] ?: null) : $asset->model,
+            'serial_number' => array_key_exists('serial_number', $data)
+                ? ($data['serial_number'] ?: null)
+                : $asset->serial_number,
+            'installed_on' => array_key_exists('installed_on', $data)
+                ? (!empty($data['installed_on']) ? Carbon::parse($data['installed_on'])->toDateString() : null)
+                : $asset->installed_on,
+            'warranty_expires_on' => array_key_exists('warranty_expires_on', $data)
+                ? (!empty($data['warranty_expires_on']) ? Carbon::parse($data['warranty_expires_on'])->toDateString() : null)
+                : $asset->warranty_expires_on,
+            'notes' => array_key_exists('notes', $data) ? ($data['notes'] ?: null) : $asset->notes,
+            'updated_at' => now(),
+        ]);
+
+        return response()->json(['ok' => true, 'id' => $assetId]);
+    }
+
+    public function deleteAsset(Request $request, int $homeId, int $assetId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $this->abortUnlessHome($userId, $homeId);
+
+        $exists = DB::table('home_assets')
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->where('id', $assetId)
+            ->exists();
+
+        abort_if(!$exists, 404, 'Asset not found.');
+
+        DB::transaction(function () use ($assetId) {
+            foreach (['maintenance_items', 'ledger_entries', 'receipts', 'documents'] as $table) {
+                $this->clearContextReference($table, 'asset_id', $assetId);
+            }
+
+            DB::table('home_assets')->where('id', $assetId)->delete();
+        });
+
+        return response()->json(['ok' => true]);
     }
 
     public function timeline(Request $request, int $homeId)
@@ -245,6 +499,53 @@ class HomeOpsHomeController extends Controller
         ]);
 
         return response()->json(['ok' => true, 'id' => $id], 201);
+    }
+
+    public function updateTimelineEvent(Request $request, int $homeId, int $eventId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $this->abortUnlessHome($userId, $homeId);
+
+        $data = $request->validate([
+            'event_type' => ['required', Rule::in(['purchase', 'keys', 'move_in', 'setup', 'repair', 'upgrade', 'review', 'custom'])],
+            'title' => ['required', 'string', 'max:180'],
+            'event_date' => ['required', 'date'],
+            'description' => ['nullable', 'string'],
+        ]);
+
+        $exists = DB::table('ownership_events')
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->where('id', $eventId)
+            ->exists();
+
+        abort_if(!$exists, 404, 'Property milestone not found.');
+
+        DB::table('ownership_events')->where('id', $eventId)->update([
+            'event_type' => $data['event_type'],
+            'title' => $data['title'],
+            'event_date' => Carbon::parse($data['event_date'])->toDateString(),
+            'description' => $data['description'] ?? null,
+            'updated_at' => now(),
+        ]);
+
+        return response()->json(['ok' => true, 'id' => $eventId]);
+    }
+
+    public function deleteTimelineEvent(Request $request, int $homeId, int $eventId)
+    {
+        $userId = HomeOpsV0::userId($request);
+        $this->abortUnlessHome($userId, $homeId);
+
+        $deleted = DB::table('ownership_events')
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->where('id', $eventId)
+            ->delete();
+
+        abort_if(!$deleted, 404, 'Property milestone not found.');
+
+        return response()->json(['ok' => true]);
     }
 
     public function storeSetup(Request $request)
@@ -382,6 +683,9 @@ class HomeOpsHomeController extends Controller
                 }
                 if (Schema::hasColumn('bills', 'is_core_bill')) {
                     $billPayload['is_core_bill'] = $coreSourceKey ? 1 : 0;
+                }
+                if (Schema::hasColumn('bills', 'bill_type')) {
+                    $billPayload['bill_type'] = $coreSourceKey ? 'core' : (($bill['frequency'] ?? null) === 'once' ? 'one_time' : 'recurring');
                 }
 
                 $billPayload = HomeOpsV0::addHomeId($billPayload, 'bills', $homeId);
@@ -589,6 +893,82 @@ class HomeOpsHomeController extends Controller
             ->where('home_id', $homeId)
             ->where('user_id', $viewerUserId)
             ->value('role') ?: 'viewer');
+    }
+
+    private function resolveOwnedRoomId(int $userId, int $homeId, $roomId): ?int
+    {
+        if (!$roomId) {
+            return null;
+        }
+
+        $exists = DB::table('rooms')
+            ->where('id', (int) $roomId)
+            ->where('user_id', $userId)
+            ->where('home_id', $homeId)
+            ->exists();
+
+        abort_unless($exists, 422, 'The selected room does not belong to this property.');
+
+        return (int) $roomId;
+    }
+
+    private function clearContextReference(string $table, string $column, int $id): void
+    {
+        if (!Schema::hasTable($table) || !Schema::hasColumn($table, $column)) {
+            return;
+        }
+
+        $payload = [$column => null];
+        if (Schema::hasColumn($table, 'updated_at')) {
+            $payload['updated_at'] = now();
+        }
+
+        DB::table($table)
+            ->where($column, $id)
+            ->update($payload);
+    }
+
+    private function storedDocumentsForHome(int $homeId)
+    {
+        if (
+            !Schema::hasTable('documents')
+            || !Schema::hasColumn('documents', 'home_id')
+            || !Schema::hasColumn('documents', 'storage_disk')
+            || !Schema::hasColumn('documents', 'file_path')
+        ) {
+            return collect();
+        }
+
+        return DB::table('documents')
+            ->where('home_id', $homeId)
+            ->whereNotNull('file_path')
+            ->get(['storage_disk', 'file_path']);
+    }
+
+    private function idsForHome(string $tableName, int $homeId)
+    {
+        if (
+            !Schema::hasTable($tableName)
+            || !Schema::hasColumn($tableName, 'id')
+            || !Schema::hasColumn($tableName, 'home_id')
+        ) {
+            return collect();
+        }
+
+        return DB::table($tableName)
+            ->where('home_id', $homeId)
+            ->pluck('id');
+    }
+
+    private function deleteRowsForHome(string $tableName, int $homeId): void
+    {
+        if (!Schema::hasTable($tableName) || !Schema::hasColumn($tableName, 'home_id')) {
+            return;
+        }
+
+        DB::table($tableName)
+            ->where('home_id', $homeId)
+            ->delete();
     }
 
     private function abortUnlessHome(int $userId, int $homeId): void

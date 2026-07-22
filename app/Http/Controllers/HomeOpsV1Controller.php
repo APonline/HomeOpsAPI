@@ -7,8 +7,11 @@ use App\Support\HomeOpsSchemaRepair;
 use App\Support\HomeOpsV0;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 
 class HomeOpsV1Controller extends Controller
@@ -159,6 +162,9 @@ class HomeOpsV1Controller extends Controller
         $hasFavourite = isset($columns['is_favourite']);
         $hasExpires = isset($columns['expires_on']);
         $hasDocumentDate = isset($columns['document_date']);
+        $hasFilePath = isset($columns['file_path']);
+        $hasFileSize = isset($columns['file_size']);
+        $hasMimeType = isset($columns['mime_type']);
 
         $query = DB::table('documents')->where('user_id', $userId);
 
@@ -175,15 +181,21 @@ class HomeOpsV1Controller extends Controller
         $query->orderByDesc('id');
 
         HomeOpsV0::unqualifiedHomeFilter($query, 'documents', $homeId);
-        $documents = $query->get()->map(function ($document) use ($hasFavourite, $hasExpires) {
+        $documents = $query->get()->map(function ($document) use ($hasFavourite, $hasExpires, $hasFilePath, $hasFileSize, $hasMimeType) {
             $expiresOn = $hasExpires ? ($document->expires_on ?? null) : null;
             $expires = $expiresOn ? Carbon::parse($expiresOn) : null;
+            $filePath = $hasFilePath ? ($document->file_path ?? null) : null;
+            $documentData = (array) $document;
+            unset($documentData['file_path'], $documentData['storage_disk']);
 
-            return array_merge((array) $document, [
+            return array_merge($documentData, [
                 'is_favourite' => $hasFavourite ? (bool) ($document->is_favourite ?? false) : false,
                 'expires_on' => $expiresOn,
                 'is_expired' => $expires ? $expires->isPast() : false,
                 'expires_soon' => $expires ? $expires->betweenIncluded(now()->startOfDay(), now()->addDays(60)->endOfDay()) : false,
+                'has_upload' => !empty($filePath),
+                'file_size' => $hasFileSize && isset($document->file_size) ? (int) $document->file_size : null,
+                'mime_type' => $hasMimeType ? ($document->mime_type ?? null) : null,
             ]);
         });
 
@@ -197,6 +209,7 @@ class HomeOpsV1Controller extends Controller
                 'expired' => $documents->where('is_expired', true)->count(),
             ],
             'schema_ready' => $hasFavourite && $hasExpires,
+            'uploads_ready' => $this->documentUploadSchemaReady(),
         ]);
     }
 
@@ -206,13 +219,30 @@ class HomeOpsV1Controller extends Controller
 
         $userId = HomeOpsV0::userId($request);
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
-        $payload = $this->documentPayload($this->validateDocument($request), $userId, $homeId);
+        $data = $this->validateDocument($request);
+        $storedFile = null;
 
-        if (Schema::hasColumn('documents', 'created_at')) {
-            $payload['created_at'] = now();
+        try {
+            if ($request->hasFile('document_file')) {
+                abort_unless($this->documentUploadSchemaReady(), 503, 'Document uploads need the latest database migration.');
+                $storedFile = $this->storeDocumentUpload($request->file('document_file'), $userId, $homeId);
+            }
+
+            $payload = $this->documentPayload($data, $userId, $homeId);
+            if ($storedFile) {
+                $payload = array_merge($payload, $storedFile);
+            }
+
+            if (Schema::hasColumn('documents', 'created_at')) {
+                $payload['created_at'] = now();
+            }
+
+            $id = DB::table('documents')->insertGetId($payload);
+        } catch (\Throwable $exception) {
+            $this->deleteStoredDocumentFile($storedFile);
+            throw $exception;
         }
 
-        $id = DB::table('documents')->insertGetId($payload);
         return response()->json(['ok' => true, 'id' => $id], 201);
     }
 
@@ -224,11 +254,70 @@ class HomeOpsV1Controller extends Controller
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
         $query = DB::table('documents')->where('user_id', $userId)->where('id', $documentId);
         HomeOpsV0::unqualifiedHomeFilter($query, 'documents', $homeId);
-        abort_if(!$query->exists(), 404, 'Document not found.');
-        DB::table('documents')->where('id', $documentId)->update($this->documentPayload(
-            $this->validateDocument($request), $userId, $homeId, false
-        ));
+        $document = $query->first();
+        abort_if(!$document, 404, 'Document not found.');
+
+        $data = $this->validateDocument($request);
+        $storedFile = null;
+        $replaceOrRemoveFile = false;
+
+        try {
+            $payload = $this->documentPayload($data, $userId, $homeId, false);
+
+            if ($request->hasFile('document_file')) {
+                abort_unless($this->documentUploadSchemaReady(), 503, 'Document uploads need the latest database migration.');
+                $storedFile = $this->storeDocumentUpload($request->file('document_file'), $userId, $homeId);
+                $payload = array_merge($payload, $storedFile);
+                $replaceOrRemoveFile = true;
+            } elseif (!empty($data['remove_uploaded_file']) && $this->documentUploadSchemaReady()) {
+                $payload = array_merge($payload, [
+                    'storage_disk' => null,
+                    'file_path' => null,
+                    'mime_type' => null,
+                    'file_size' => null,
+                    'file_name' => !empty($data['file_url']) ? ($data['file_name'] ?? null) : null,
+                ]);
+                $replaceOrRemoveFile = true;
+            }
+
+            DB::table('documents')->where('id', $documentId)->update($payload);
+        } catch (\Throwable $exception) {
+            $this->deleteStoredDocumentFile($storedFile);
+            throw $exception;
+        }
+
+        if ($replaceOrRemoveFile) {
+            $this->deleteStoredDocumentFile($document);
+        }
+
         return response()->json(['ok' => true, 'id' => $documentId]);
+    }
+
+    public function downloadDocument(Request $request, int $documentId)
+    {
+        abort_unless(Schema::hasTable('documents') && $this->documentUploadSchemaReady(), 404, 'Uploaded document not found.');
+
+        $userId = HomeOpsV0::userId($request);
+        $homeId = HomeOpsV0::resolveHomeId($request, $userId);
+        $query = DB::table('documents')->where('user_id', $userId)->where('id', $documentId);
+        HomeOpsV0::unqualifiedHomeFilter($query, 'documents', $homeId);
+        $document = $query->first();
+
+        abort_if(!$document || empty($document->file_path), 404, 'Uploaded document not found.');
+
+        $disk = $document->storage_disk ?: 'local';
+        abort_unless(Storage::disk($disk)->exists($document->file_path), 404, 'The uploaded file is missing from storage.');
+
+        $headers = [];
+        if (!empty($document->mime_type)) {
+            $headers['Content-Type'] = $document->mime_type;
+        }
+
+        return Storage::disk($disk)->download(
+            $document->file_path,
+            $document->file_name ?: basename($document->file_path),
+            $headers,
+        );
     }
 
     public function deleteDocument(Request $request, int $documentId)
@@ -239,8 +328,12 @@ class HomeOpsV1Controller extends Controller
         $homeId = HomeOpsV0::resolveHomeId($request, $userId);
         $query = DB::table('documents')->where('user_id', $userId)->where('id', $documentId);
         HomeOpsV0::unqualifiedHomeFilter($query, 'documents', $homeId);
-        abort_if(!$query->exists(), 404, 'Document not found.');
+        $document = $query->first();
+        abort_if(!$document, 404, 'Document not found.');
+
         DB::table('documents')->where('id', $documentId)->delete();
+        $this->deleteStoredDocumentFile($document);
+
         return response()->json(['ok' => true]);
     }
 
@@ -439,9 +532,14 @@ class HomeOpsV1Controller extends Controller
             'title' => ['required', 'string', 'max:180'],
             'document_type' => ['required', Rule::in(['mortgage', 'insurance', 'condo', 'tax', 'warranty', 'manual', 'invoice', 'receipt', 'contract', 'inspection', 'utility', 'identity', 'other'])],
             'provider' => ['nullable', 'string', 'max:160'],
-            'document_date' => ['nullable', 'date'], 'expires_on' => ['nullable', 'date'],
-            'file_url' => ['nullable', 'string', 'max:700'], 'file_name' => ['nullable', 'string', 'max:255'],
-            'notes' => ['nullable', 'string'], 'is_favourite' => ['nullable', 'boolean'],
+            'document_date' => ['nullable', 'date'],
+            'expires_on' => ['nullable', 'date'],
+            'file_url' => ['nullable', 'url', 'max:700'],
+            'file_name' => ['nullable', 'string', 'max:255'],
+            'notes' => ['nullable', 'string'],
+            'is_favourite' => ['nullable', 'boolean'],
+            'remove_uploaded_file' => ['nullable', 'boolean'],
+            'document_file' => ['nullable', 'file', 'max:20480', 'mimes:pdf,jpg,jpeg,png,webp,heic,doc,docx,xls,xlsx,csv,txt,rtf,odt,ods'],
         ]);
     }
 
@@ -475,6 +573,53 @@ class HomeOpsV1Controller extends Controller
         }
 
         return $payload;
+    }
+
+    private function documentUploadSchemaReady(): bool
+    {
+        return Schema::hasTable('documents')
+            && Schema::hasColumn('documents', 'storage_disk')
+            && Schema::hasColumn('documents', 'file_path')
+            && Schema::hasColumn('documents', 'mime_type')
+            && Schema::hasColumn('documents', 'file_size');
+    }
+
+    private function storeDocumentUpload(UploadedFile $file, int $userId, ?int $homeId): array
+    {
+        $disk = 'local';
+        $directory = sprintf('homeops/documents/%d/%s', $userId, $homeId ?: 'shared');
+        $extension = strtolower($file->getClientOriginalExtension());
+        $storedName = Str::uuid()->toString().($extension ? '.'.$extension : '');
+        $path = $file->storeAs($directory, $storedName, $disk);
+
+        abort_if(!$path, 500, 'The document file could not be stored.');
+
+        return [
+            'storage_disk' => $disk,
+            'file_path' => $path,
+            'file_name' => Str::limit(basename($file->getClientOriginalName()), 255, ''),
+            'mime_type' => $file->getMimeType(),
+            'file_size' => $file->getSize(),
+        ];
+    }
+
+    private function deleteStoredDocumentFile(object|array|null $document): void
+    {
+        if (!$document) {
+            return;
+        }
+
+        $data = (array) $document;
+        $path = $data['file_path'] ?? null;
+        if (!$path) {
+            return;
+        }
+
+        try {
+            Storage::disk($data['storage_disk'] ?? 'local')->delete($path);
+        } catch (\Throwable $exception) {
+            report($exception);
+        }
     }
 
     private function payoffProjection(float $balance, float $annualRate, float $payment): array

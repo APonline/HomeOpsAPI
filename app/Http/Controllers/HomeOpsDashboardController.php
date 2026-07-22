@@ -72,6 +72,7 @@ class HomeOpsDashboardController extends Controller
                 'status' => $status,
                 'amount' => $amount !== null ? (float) $amount : null,
                 'frequency' => $bill->frequency,
+                'bill_type' => $bill->bill_type ?? ((isset($bill->is_core_bill) && (bool) $bill->is_core_bill) ? 'core' : (($bill->frequency ?? null) === 'once' ? 'one_time' : 'recurring')),
                 'is_core_bill' => isset($bill->is_core_bill) ? (bool) $bill->is_core_bill : false,
                 'source_type' => $bill->source_type ?? null,
                 'source_key' => $bill->source_key ?? null,

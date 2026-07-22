@@ -61,6 +61,7 @@ class HomeOpsReadController extends Controller
                     'amount' => $amount !== null ? (float) $amount : null,
                     'expected_amount' => $bill->expected_amount !== null ? (float) $bill->expected_amount : null,
                     'frequency' => $bill->frequency,
+                    'bill_type' => $bill->bill_type ?? ((isset($bill->is_core_bill) && (bool) $bill->is_core_bill) ? 'core' : (($bill->frequency ?? null) === 'once' ? 'one_time' : 'recurring')),
                     'autopay' => (bool) $bill->autopay,
                     'is_core_bill' => isset($bill->is_core_bill) ? (bool) $bill->is_core_bill : false,
                     'source_type' => $bill->source_type ?? null,

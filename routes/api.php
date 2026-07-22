@@ -28,12 +28,19 @@ Route::prefix('homeops')->group(function () {
         Route::post('/property-setup', [HomeOpsHomeController::class, 'storeSetup']);
         Route::get('/homes/{homeId}', [HomeOpsHomeController::class, 'show']);
         Route::patch('/homes/{homeId}', [HomeOpsHomeController::class, 'update']);
+        Route::delete('/homes/{homeId}', [HomeOpsHomeController::class, 'destroy']);
         Route::get('/homes/{homeId}/rooms', [HomeOpsHomeController::class, 'rooms']);
         Route::post('/homes/{homeId}/rooms', [HomeOpsHomeController::class, 'storeRoom']);
+        Route::patch('/homes/{homeId}/rooms/{roomId}', [HomeOpsHomeController::class, 'updateRoom']);
+        Route::delete('/homes/{homeId}/rooms/{roomId}', [HomeOpsHomeController::class, 'deleteRoom']);
         Route::get('/homes/{homeId}/assets', [HomeOpsHomeController::class, 'assets']);
         Route::post('/homes/{homeId}/assets', [HomeOpsHomeController::class, 'storeAsset']);
+        Route::patch('/homes/{homeId}/assets/{assetId}', [HomeOpsHomeController::class, 'updateAsset']);
+        Route::delete('/homes/{homeId}/assets/{assetId}', [HomeOpsHomeController::class, 'deleteAsset']);
         Route::get('/homes/{homeId}/timeline', [HomeOpsHomeController::class, 'timeline']);
         Route::post('/homes/{homeId}/timeline', [HomeOpsHomeController::class, 'storeTimelineEvent']);
+        Route::patch('/homes/{homeId}/timeline/{eventId}', [HomeOpsHomeController::class, 'updateTimelineEvent']);
+        Route::delete('/homes/{homeId}/timeline/{eventId}', [HomeOpsHomeController::class, 'deleteTimelineEvent']);
         Route::get('/homes/{homeId}/core-bills', [HomeOpsCoreBillsController::class, 'index']);
         Route::post('/homes/{homeId}/core-bills/sync', [HomeOpsCoreBillsController::class, 'sync']);
 
@@ -42,6 +49,7 @@ Route::prefix('homeops')->group(function () {
         Route::post('/properties', [HomeOpsHomeController::class, 'store']);
         Route::get('/properties/{homeId}', [HomeOpsHomeController::class, 'show']);
         Route::patch('/properties/{homeId}', [HomeOpsHomeController::class, 'update']);
+        Route::delete('/properties/{homeId}', [HomeOpsHomeController::class, 'destroy']);
         Route::get('/properties/{homeId}/core-bills', [HomeOpsCoreBillsController::class, 'index']);
         Route::post('/properties/{homeId}/core-bills/sync', [HomeOpsCoreBillsController::class, 'sync']);
 
@@ -96,6 +104,7 @@ Route::prefix('homeops')->group(function () {
 
         Route::get('/documents', [HomeOpsV1Controller::class, 'documents']);
         Route::post('/documents', [HomeOpsV1Controller::class, 'storeDocument']);
+        Route::get('/documents/{documentId}/file', [HomeOpsV1Controller::class, 'downloadDocument']);
         Route::patch('/documents/{documentId}', [HomeOpsV1Controller::class, 'updateDocument']);
         Route::delete('/documents/{documentId}', [HomeOpsV1Controller::class, 'deleteDocument']);
 

@@ -45,7 +45,10 @@ class HomeOpsBillEngine
             $expectedAmount = $bill->expected_amount !== null ? (float) $bill->expected_amount : null;
 
             if ($instance) {
-                if (!in_array($instance->status, ['paid', 'cleared', 'skipped'], true)) {
+                $isManualOverride = Schema::hasColumn('bill_instances', 'is_manual_override')
+                    && (bool) ($instance->is_manual_override ?? false);
+
+                if (!in_array($instance->status, ['paid', 'cleared', 'skipped'], true) && !$isManualOverride) {
                     DB::table('bill_instances')
                         ->where('id', $instance->id)
                         ->update([
@@ -70,6 +73,9 @@ class HomeOpsBillEngine
                 'created_at' => now(),
                 'updated_at' => now(),
             ];
+            if (Schema::hasColumn('bill_instances', 'is_manual_override')) {
+                $payload['is_manual_override'] = 0;
+            }
             $payload = HomeOpsV0::addHomeId($payload, 'bill_instances', $homeId);
 
             DB::table('bill_instances')->insert($payload);

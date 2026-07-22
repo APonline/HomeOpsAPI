@@ -111,6 +111,10 @@ class HomeOpsSchemaRepair
                 $table->date('expires_on')->nullable()->index();
                 $table->string('file_url', 700)->nullable();
                 $table->string('file_name', 255)->nullable();
+                $table->string('storage_disk', 40)->nullable();
+                $table->string('file_path', 700)->nullable();
+                $table->string('mime_type', 160)->nullable();
+                $table->unsignedBigInteger('file_size')->nullable();
                 $table->text('notes')->nullable();
                 $table->boolean('is_favourite')->default(false)->index();
                 $table->timestamps();
@@ -133,6 +137,10 @@ class HomeOpsSchemaRepair
             'expires_on' => fn (Blueprint $table) => $table->date('expires_on')->nullable()->index(),
             'file_url' => fn (Blueprint $table) => $table->string('file_url', 700)->nullable(),
             'file_name' => fn (Blueprint $table) => $table->string('file_name', 255)->nullable(),
+            'storage_disk' => fn (Blueprint $table) => $table->string('storage_disk', 40)->nullable(),
+            'file_path' => fn (Blueprint $table) => $table->string('file_path', 700)->nullable(),
+            'mime_type' => fn (Blueprint $table) => $table->string('mime_type', 160)->nullable(),
+            'file_size' => fn (Blueprint $table) => $table->unsignedBigInteger('file_size')->nullable(),
             'notes' => fn (Blueprint $table) => $table->text('notes')->nullable(),
             'is_favourite' => fn (Blueprint $table) => $table->boolean('is_favourite')->default(false)->index(),
             'created_at' => fn (Blueprint $table) => $table->timestamp('created_at')->nullable(),
@@ -168,6 +176,12 @@ class HomeOpsSchemaRepair
     /** @param array<int, string> $changes */
     private static function ensureOperationalColumns(array &$changes): void
     {
+        if (Schema::hasTable('bill_instances')) {
+            self::addMissingColumns('bill_instances', [
+                'is_manual_override' => fn (Blueprint $table) => $table->boolean('is_manual_override')->default(false),
+            ], $changes);
+        }
+
         if (Schema::hasTable('ledger_entries')) {
             self::addMissingColumns('ledger_entries', [
                 'financial_account_id' => fn (Blueprint $table) => $table->foreignId('financial_account_id')->nullable()->index(),
