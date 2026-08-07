@@ -556,8 +556,15 @@ class HomeOpsWriteController extends Controller
             'asset_id' => ['nullable', 'integer'],
             'vendor' => ['required', 'string', 'max:180'],
             'date' => ['required', 'date'],
+            'subtotal' => ['nullable', 'numeric', 'min:0'],
+            'tax' => ['nullable', 'numeric', 'min:0'],
+            'tip' => ['nullable', 'numeric', 'min:0'],
             'total' => ['required', 'numeric', 'min:0'],
+            'currency' => ['nullable', 'string', 'size:3'],
+            'payment_method' => ['nullable', 'string', 'max:80'],
             'category' => ['nullable', 'string', 'max:100'],
+            'file_url' => ['nullable', 'string', 'max:700'],
+            'file_name' => ['nullable', 'string', 'max:255'],
             'notes' => ['nullable', 'string'],
         ]);
 
@@ -595,10 +602,25 @@ class HomeOpsWriteController extends Controller
                 'vendor_name_raw' => $data['vendor'],
                 'total_amount' => $data['total'],
                 'status' => 'manual',
+                'file_url' => $data['file_url'] ?? null,
+                'file_name' => $data['file_name'] ?? null,
                 'notes' => $data['notes'] ?? null,
                 'created_at' => now(),
                 'updated_at' => now(),
             ];
+            foreach ([
+                'subtotal_amount' => $data['subtotal'] ?? null,
+                'tax_amount' => $data['tax'] ?? null,
+                'tip_amount' => $data['tip'] ?? null,
+                'currency' => strtoupper($data['currency'] ?? 'CAD'),
+                'payment_method' => $data['payment_method'] ?? null,
+                'capture_source' => 'manual',
+            ] as $column => $value) {
+                if (Schema::hasColumn('receipts', $column)) {
+                    $receiptPayload[$column] = $value;
+                }
+            }
+
             $receiptPayload = HomeOpsV0::addHomeId($receiptPayload, 'receipts', $homeId);
             $receiptPayload = HomeOpsV0::addRoomId($receiptPayload, 'receipts', $data['room_id'] ?? null);
             $receiptPayload = HomeOpsV0::addAssetId($receiptPayload, 'receipts', $data['asset_id'] ?? null);

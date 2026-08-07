@@ -27,27 +27,72 @@ class HomeOpsRecordsController extends Controller
             ->orderByDesc('receipts.id');
         HomeOpsV0::homeFilter($query, 'receipts', $homeId);
 
-        $receipts = $query->get([
+        $rows = $query->get([
             'receipts.*',
             'vendors.name as vendor_name',
             'categories.name as category_name',
             'ledger_entries.title as ledger_title',
-        ])->map(fn ($receipt) => [
-            'id' => (int) $receipt->id,
-            'home_id' => $receipt->home_id ? (int) $receipt->home_id : null,
-            'ledger_entry_id' => $receipt->ledger_entry_id ? (int) $receipt->ledger_entry_id : null,
-            'vendor' => $receipt->vendor_name ?: $receipt->vendor_name_raw,
-            'vendor_name_raw' => $receipt->vendor_name_raw,
-            'date' => $receipt->receipt_date,
-            'receipt_date' => $receipt->receipt_date,
-            'total' => (float) $receipt->total_amount,
-            'total_amount' => (float) $receipt->total_amount,
-            'category' => $receipt->category_name,
-            'status' => $receipt->status,
-            'file_url' => $receipt->file_url ?? null,
-            'file_name' => $receipt->file_name ?? null,
-            'notes' => $receipt->notes,
         ]);
+        $receiptIds = $rows->pluck('id')->map(fn ($id) => (int) $id)->all();
+        $itemsByReceipt = Schema::hasTable('receipt_items') && $receiptIds
+            ? DB::table('receipt_items')->whereIn('receipt_id', $receiptIds)
+                ->orderBy('line_order')
+                ->get([
+                    'id',
+                    'receipt_id',
+                    'line_order as line_number',
+                    'item_name as description',
+                    'quantity',
+                    'unit_price',
+                    'line_total',
+                    'notes as category_hint',
+                    'created_at',
+                    'updated_at',
+                ])
+                ->groupBy('receipt_id')
+            : collect();
+
+        $receipts = $rows->map(function ($receipt) use ($itemsByReceipt) {
+            $items = collect($itemsByReceipt->get($receipt->id, []))->map(fn ($item) => [
+                'id' => (int) $item->id,
+                'description' => $item->description,
+                'quantity' => $item->quantity !== null ? (float) $item->quantity : null,
+                'unit_price' => $item->unit_price !== null ? (float) $item->unit_price : null,
+                'line_total' => $item->line_total !== null ? (float) $item->line_total : null,
+                'category_hint' => $item->category_hint,
+            ])->values()->all();
+
+            return [
+                'id' => (int) $receipt->id,
+                'home_id' => $receipt->home_id ? (int) $receipt->home_id : null,
+                'ledger_entry_id' => $receipt->ledger_entry_id ? (int) $receipt->ledger_entry_id : null,
+                'vendor' => $receipt->vendor_name ?: $receipt->vendor_name_raw,
+                'vendor_name_raw' => $receipt->vendor_name_raw,
+                'date' => $receipt->receipt_date,
+                'receipt_date' => $receipt->receipt_date,
+                'subtotal' => isset($receipt->subtotal_amount) && $receipt->subtotal_amount !== null ? (float) $receipt->subtotal_amount : null,
+                'tax' => isset($receipt->tax_amount) && $receipt->tax_amount !== null ? (float) $receipt->tax_amount : null,
+                'tip' => isset($receipt->tip_amount) && $receipt->tip_amount !== null ? (float) $receipt->tip_amount : null,
+                'total' => (float) $receipt->total_amount,
+                'total_amount' => (float) $receipt->total_amount,
+                'currency' => $receipt->currency ?? 'CAD',
+                'payment_method' => $receipt->payment_method ?? null,
+                'category' => $receipt->category_name,
+                'status' => $receipt->status,
+                'capture_source' => $receipt->capture_source ?? 'manual',
+                'extraction_provider' => $receipt->extraction_provider ?? null,
+                'extraction_confidence' => isset($receipt->extraction_confidence) && $receipt->extraction_confidence !== null
+                    ? (float) $receipt->extraction_confidence : null,
+                'file_url' => $receipt->file_url ?? null,
+                'file_name' => $receipt->file_name ?? null,
+                'has_upload' => !empty($receipt->file_path),
+                'mime_type' => $receipt->mime_type ?? null,
+                'file_size' => isset($receipt->file_size) && $receipt->file_size !== null ? (int) $receipt->file_size : null,
+                'notes' => $receipt->notes,
+                'line_items' => $items,
+                'item_count' => count($items),
+            ];
+        });
 
         return response()->json([
             'home' => HomeOpsV0::homeSummary($homeId),
@@ -56,7 +101,9 @@ class HomeOpsRecordsController extends Controller
             'summary' => [
                 'count' => $receipts->count(),
                 'total' => round((float) $receipts->sum('total_amount'), 2),
-                'with_files' => $receipts->whereNotNull('file_url')->count(),
+                'with_files' => $receipts->filter(fn ($receipt) => $receipt['has_upload'] || !empty($receipt['file_url']))->count(),
+                'scanned' => $receipts->where('capture_source', 'scan')->count(),
+                'items' => $receipts->sum('item_count'),
             ],
         ]);
     }
@@ -68,11 +115,22 @@ class HomeOpsRecordsController extends Controller
         $data = $request->validate([
             'vendor' => ['required', 'string', 'max:180'],
             'date' => ['required', 'date'],
+            'subtotal' => ['nullable', 'numeric', 'min:0'],
+            'tax' => ['nullable', 'numeric', 'min:0'],
+            'tip' => ['nullable', 'numeric', 'min:0'],
             'total' => ['required', 'numeric', 'min:0'],
+            'currency' => ['nullable', 'string', 'size:3'],
+            'payment_method' => ['nullable', 'string', 'max:80'],
             'category' => ['nullable', 'string', 'max:120'],
             'file_url' => ['nullable', 'string', 'max:700'],
             'file_name' => ['nullable', 'string', 'max:255'],
             'notes' => ['nullable', 'string'],
+            'line_items' => ['nullable', 'array', 'max:80'],
+            'line_items.*.description' => ['required_with:line_items', 'string', 'max:255'],
+            'line_items.*.quantity' => ['nullable', 'numeric', 'min:0'],
+            'line_items.*.unit_price' => ['nullable', 'numeric', 'min:0'],
+            'line_items.*.line_total' => ['nullable', 'numeric', 'min:0'],
+            'line_items.*.category_hint' => ['nullable', 'string', 'max:120'],
         ]);
 
         return DB::transaction(function () use ($userId, $homeId, $receiptId, $data) {
@@ -85,16 +143,45 @@ class HomeOpsRecordsController extends Controller
             $vendorId = $this->firstOrCreateVendor($userId, $data['vendor'], 'store', $categoryId);
             $date = Carbon::parse($data['date'])->toDateString();
 
-            DB::table('receipts')->where('id', $receiptId)->update([
+            $payload = [
                 'vendor_id' => $vendorId,
                 'receipt_date' => $date,
                 'vendor_name_raw' => $data['vendor'],
                 'total_amount' => $data['total'],
                 'file_url' => $data['file_url'] ?? null,
-                'file_name' => $data['file_name'] ?? null,
+                'file_name' => $data['file_name'] ?? ($receipt->file_name ?? null),
                 'notes' => $data['notes'] ?? null,
                 'updated_at' => now(),
-            ]);
+            ];
+            foreach ([
+                'subtotal_amount' => $data['subtotal'] ?? null,
+                'tax_amount' => $data['tax'] ?? null,
+                'tip_amount' => $data['tip'] ?? null,
+                'currency' => strtoupper($data['currency'] ?? 'CAD'),
+                'payment_method' => $data['payment_method'] ?? null,
+            ] as $column => $value) {
+                if (Schema::hasColumn('receipts', $column)) $payload[$column] = $value;
+            }
+            DB::table('receipts')->where('id', $receiptId)->update($payload);
+
+            if (Schema::hasTable('receipt_items') && array_key_exists('line_items', $data)) {
+                DB::table('receipt_items')->where('receipt_id', $receiptId)->delete();
+                foreach (array_values($data['line_items'] ?? []) as $index => $item) {
+                    DB::table('receipt_items')->insert([
+                        'receipt_id' => $receiptId,
+                        'line_order' => $index + 1,
+                        'item_name' => $item['description'],
+                        'quantity' => $item['quantity'] ?? null,
+                        'unit_price' => $item['unit_price'] ?? null,
+                        'line_total' => $item['line_total'] ?? null,
+                        'notes' => !empty($item['category_hint'])
+                            ? 'Category: '.$item['category_hint']
+                            : null,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ]);
+                }
+            }
 
             if ($receipt->ledger_entry_id) {
                 DB::table('ledger_entries')->where('user_id', $userId)->where('id', $receipt->ledger_entry_id)->update([
@@ -124,10 +211,16 @@ class HomeOpsRecordsController extends Controller
             $receipt = $query->first();
             abort_if(!$receipt, 404, 'Receipt not found.');
 
+            if (Schema::hasTable('receipt_items')) {
+                DB::table('receipt_items')->where('receipt_id', $receiptId)->delete();
+            }
             DB::table('receipts')->where('id', $receiptId)->delete();
             if ($receipt->ledger_entry_id) {
                 DB::table('period_ledger_entries')->where('ledger_entry_id', $receipt->ledger_entry_id)->delete();
                 DB::table('ledger_entries')->where('user_id', $userId)->where('id', $receipt->ledger_entry_id)->delete();
+            }
+            if (!empty($receipt->file_path)) {
+                \Illuminate\Support\Facades\Storage::disk($receipt->storage_disk ?: 'local')->delete($receipt->file_path);
             }
 
             return response()->json(['ok' => true]);

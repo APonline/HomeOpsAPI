@@ -8,8 +8,10 @@ use App\Http\Controllers\HomeOpsWriteController;
 use App\Http\Controllers\HomeOpsHomeController;
 use App\Http\Controllers\HomeOpsBudgetController;
 use App\Http\Controllers\HomeOpsCoreBillsController;
+use App\Http\Controllers\HomeOpsCloseoutController;
 use App\Http\Controllers\HomeOpsV0StatusController;
 use App\Http\Controllers\HomeOpsRecordsController;
+use App\Http\Controllers\HomeOpsReceiptScanController;
 use App\Http\Controllers\HomeOpsV1Controller;
 use App\Http\Middleware\HomeOpsTokenAuth;
 
@@ -59,6 +61,10 @@ Route::prefix('homeops')->group(function () {
         Route::get('/budget-profile', [HomeOpsBudgetController::class, 'show']);
         Route::patch('/budget-profile', [HomeOpsBudgetController::class, 'update']);
 
+        Route::get('/month-close', [HomeOpsCloseoutController::class, 'show']);
+        Route::post('/month-close/close', [HomeOpsCloseoutController::class, 'close']);
+        Route::post('/month-close/reopen', [HomeOpsCloseoutController::class, 'reopen']);
+
         Route::get('/bills', [HomeOpsReadController::class, 'bills']);
         Route::post('/bills', [HomeOpsWriteController::class, 'storeBill']);
         Route::patch('/bills/{billId}/mark-paid', [HomeOpsWriteController::class, 'markBillPaid']);
@@ -70,6 +76,10 @@ Route::prefix('homeops')->group(function () {
 
         Route::get('/receipts', [HomeOpsRecordsController::class, 'receipts']);
         Route::post('/receipts', [HomeOpsWriteController::class, 'storeReceipt']);
+        Route::post('/receipts/scan', [HomeOpsReceiptScanController::class, 'scan']);
+        Route::post('/receipts/scans/{scanId}/commit', [HomeOpsReceiptScanController::class, 'commit']);
+        Route::delete('/receipts/scans/{scanId}', [HomeOpsReceiptScanController::class, 'cancel']);
+        Route::get('/receipts/{receiptId}/file', [HomeOpsReceiptScanController::class, 'download']);
         Route::patch('/receipts/{receiptId}', [HomeOpsRecordsController::class, 'updateReceipt']);
         Route::delete('/receipts/{receiptId}', [HomeOpsRecordsController::class, 'deleteReceipt']);
 

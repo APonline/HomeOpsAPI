@@ -14,6 +14,13 @@ return [
     |
     */
 
+
+    'openai' => [
+        'api_key' => env('OPENAI_API_KEY'),
+        'receipt_model' => env('OPENAI_RECEIPT_MODEL', 'gpt-4.1-mini'),
+        'receipt_timeout' => env('OPENAI_RECEIPT_TIMEOUT', 45),
+    ],
+
     'postmark' => [
         'key' => env('POSTMARK_API_KEY'),
     ],
