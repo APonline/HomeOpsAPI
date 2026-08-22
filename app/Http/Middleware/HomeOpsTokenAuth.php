@@ -44,6 +44,12 @@ class HomeOpsTokenAuth
             return response()->json(['message' => 'Unauthenticated.'], 401);
         }
 
+        if (Schema::hasColumn('users', 'account_status') && ($user->account_status ?? 'active') !== 'active') {
+            return response()->json([
+                'message' => 'This HomeOps account is not currently active. Contact support if you need help.',
+            ], 403);
+        }
+
         $request->attributes->set('homeops_token_hash', $token->token_hash);
         $request->setUserResolver(fn () => $user);
 

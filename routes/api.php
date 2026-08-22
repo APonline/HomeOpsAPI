@@ -13,17 +13,27 @@ use App\Http\Controllers\HomeOpsV0StatusController;
 use App\Http\Controllers\HomeOpsRecordsController;
 use App\Http\Controllers\HomeOpsReceiptScanController;
 use App\Http\Controllers\HomeOpsV1Controller;
+use App\Http\Controllers\HomeOpsAdminController;
+use App\Http\Controllers\HomeOpsPublicContentController;
+use App\Http\Controllers\HomeOpsFeatureController;
 use App\Http\Middleware\HomeOpsTokenAuth;
+use App\Http\Middleware\HomeOpsAdminAuth;
+use App\Http\Middleware\HomeOpsRequestAudit;
 
 Route::prefix('homeops')->group(function () {
-    Route::post('/auth/login', [HomeOpsAuthController::class, 'login']);
-    Route::post('/auth/register', [HomeOpsAuthController::class, 'register']);
+    // Public auth attempts are still request-audited (credentials are redacted by middleware).
+    Route::middleware([HomeOpsRequestAudit::class])->group(function () {
+        Route::post('/auth/login', [HomeOpsAuthController::class, 'login']);
+        Route::post('/auth/register', [HomeOpsAuthController::class, 'register']);
+        Route::get('/public/content', [HomeOpsPublicContentController::class, 'index']);
+    });
 
-    Route::middleware([HomeOpsTokenAuth::class])->group(function () {
+    Route::middleware([HomeOpsTokenAuth::class, HomeOpsRequestAudit::class])->group(function () {
         Route::get('/auth/me', [HomeOpsAuthController::class, 'me']);
         Route::patch('/auth/profile', [HomeOpsAuthController::class, 'updateProfile']);
         Route::patch('/auth/password', [HomeOpsAuthController::class, 'updatePassword']);
         Route::post('/auth/logout', [HomeOpsAuthController::class, 'logout']);
+        Route::get('/features', [HomeOpsFeatureController::class, 'index']);
 
         Route::get('/homes', [HomeOpsHomeController::class, 'index']);
         Route::post('/homes', [HomeOpsHomeController::class, 'store']);
@@ -61,9 +71,9 @@ Route::prefix('homeops')->group(function () {
         Route::get('/budget-profile', [HomeOpsBudgetController::class, 'show']);
         Route::patch('/budget-profile', [HomeOpsBudgetController::class, 'update']);
 
-        Route::get('/month-close', [HomeOpsCloseoutController::class, 'show']);
-        Route::post('/month-close/close', [HomeOpsCloseoutController::class, 'close']);
-        Route::post('/month-close/reopen', [HomeOpsCloseoutController::class, 'reopen']);
+        Route::get('/month-close', [HomeOpsCloseoutController::class, 'show'])->middleware('homeops.feature:month_close');
+        Route::post('/month-close/close', [HomeOpsCloseoutController::class, 'close'])->middleware('homeops.feature:month_close');
+        Route::post('/month-close/reopen', [HomeOpsCloseoutController::class, 'reopen'])->middleware('homeops.feature:month_close');
 
         Route::get('/bills', [HomeOpsReadController::class, 'bills']);
         Route::post('/bills', [HomeOpsWriteController::class, 'storeBill']);
@@ -76,9 +86,9 @@ Route::prefix('homeops')->group(function () {
 
         Route::get('/receipts', [HomeOpsRecordsController::class, 'receipts']);
         Route::post('/receipts', [HomeOpsWriteController::class, 'storeReceipt']);
-        Route::post('/receipts/scan', [HomeOpsReceiptScanController::class, 'scan']);
-        Route::post('/receipts/scans/{scanId}/commit', [HomeOpsReceiptScanController::class, 'commit']);
-        Route::delete('/receipts/scans/{scanId}', [HomeOpsReceiptScanController::class, 'cancel']);
+        Route::post('/receipts/scan', [HomeOpsReceiptScanController::class, 'scan'])->middleware('homeops.feature:receipt_scanner');
+        Route::post('/receipts/scans/{scanId}/commit', [HomeOpsReceiptScanController::class, 'commit'])->middleware('homeops.feature:receipt_scanner');
+        Route::delete('/receipts/scans/{scanId}', [HomeOpsReceiptScanController::class, 'cancel'])->middleware('homeops.feature:receipt_scanner');
         Route::get('/receipts/{receiptId}/file', [HomeOpsReceiptScanController::class, 'download']);
         Route::patch('/receipts/{receiptId}', [HomeOpsRecordsController::class, 'updateReceipt']);
         Route::delete('/receipts/{receiptId}', [HomeOpsRecordsController::class, 'deleteReceipt']);
@@ -107,17 +117,49 @@ Route::prefix('homeops')->group(function () {
         Route::patch('/wishlist-items/{itemId}', [HomeOpsRecordsController::class, 'updateWishlistItem']);
         Route::delete('/wishlist-items/{itemId}', [HomeOpsRecordsController::class, 'deleteWishlistItem']);
 
-        Route::get('/financial-accounts', [HomeOpsV1Controller::class, 'financialAccounts']);
-        Route::post('/financial-accounts', [HomeOpsV1Controller::class, 'storeFinancialAccount']);
-        Route::patch('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'updateFinancialAccount']);
-        Route::delete('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'deleteFinancialAccount']);
+        Route::get('/financial-accounts', [HomeOpsV1Controller::class, 'financialAccounts'])->middleware('homeops.feature:financing');
+        Route::post('/financial-accounts', [HomeOpsV1Controller::class, 'storeFinancialAccount'])->middleware('homeops.feature:financing');
+        Route::patch('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'updateFinancialAccount'])->middleware('homeops.feature:financing');
+        Route::delete('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'deleteFinancialAccount'])->middleware('homeops.feature:financing');
 
-        Route::get('/documents', [HomeOpsV1Controller::class, 'documents']);
-        Route::post('/documents', [HomeOpsV1Controller::class, 'storeDocument']);
-        Route::get('/documents/{documentId}/file', [HomeOpsV1Controller::class, 'downloadDocument']);
-        Route::patch('/documents/{documentId}', [HomeOpsV1Controller::class, 'updateDocument']);
-        Route::delete('/documents/{documentId}', [HomeOpsV1Controller::class, 'deleteDocument']);
+        Route::get('/documents', [HomeOpsV1Controller::class, 'documents'])->middleware('homeops.feature:documents');
+        Route::post('/documents', [HomeOpsV1Controller::class, 'storeDocument'])->middleware('homeops.feature:documents');
+        Route::get('/documents/{documentId}/file', [HomeOpsV1Controller::class, 'downloadDocument'])->middleware('homeops.feature:documents');
+        Route::patch('/documents/{documentId}', [HomeOpsV1Controller::class, 'updateDocument'])->middleware('homeops.feature:documents');
+        Route::delete('/documents/{documentId}', [HomeOpsV1Controller::class, 'deleteDocument'])->middleware('homeops.feature:documents');
 
         Route::get('/reports', [HomeOpsV1Controller::class, 'reports']);
+
+        Route::prefix('admin')->middleware([HomeOpsAdminAuth::class])->group(function () {
+            Route::get('/overview', [HomeOpsAdminController::class, 'overview']);
+
+            Route::get('/customers', [HomeOpsAdminController::class, 'customers']);
+            Route::get('/customers/{userId}', [HomeOpsAdminController::class, 'customer']);
+            Route::get('/customers/{userId}/timeline', [HomeOpsAdminController::class, 'customerTimeline']);
+            Route::patch('/customers/{userId}', [HomeOpsAdminController::class, 'updateCustomer']);
+            Route::post('/customers/{userId}/revoke-sessions', [HomeOpsAdminController::class, 'revokeSessions']);
+            Route::post('/customers/{userId}/notes', [HomeOpsAdminController::class, 'addNote']);
+            Route::post('/customers/{userId}/support-cases', [HomeOpsAdminController::class, 'createCase']);
+            Route::post('/customers/{userId}/data-requests', [HomeOpsAdminController::class, 'createDataRequest']);
+
+            Route::get('/support-cases', [HomeOpsAdminController::class, 'supportCases']);
+            Route::get('/support-cases/{caseId}', [HomeOpsAdminController::class, 'supportCase']);
+            Route::patch('/support-cases/{caseId}', [HomeOpsAdminController::class, 'updateCase']);
+            Route::post('/support-cases/{caseId}/messages', [HomeOpsAdminController::class, 'addCaseMessage']);
+
+            Route::get('/logs', [HomeOpsAdminController::class, 'logs']);
+            Route::get('/audit-logs', [HomeOpsAdminController::class, 'auditLogs']);
+            Route::get('/system-events', [HomeOpsAdminController::class, 'systemEvents']);
+
+            Route::get('/feature-flags', [HomeOpsAdminController::class, 'featureFlags']);
+            Route::patch('/feature-flags/{flagId}', [HomeOpsAdminController::class, 'updateFeatureFlag']);
+            Route::put('/feature-flags/{flagId}/customers/{userId}', [HomeOpsAdminController::class, 'setFeatureOverride']);
+            Route::delete('/feature-flags/{flagId}/customers/{userId}', [HomeOpsAdminController::class, 'deleteFeatureOverride']);
+
+            Route::get('/cms', [HomeOpsAdminController::class, 'cmsEntries']);
+            Route::patch('/cms/{entryId}', [HomeOpsAdminController::class, 'updateCmsEntry']);
+
+            Route::patch('/data-requests/{requestId}', [HomeOpsAdminController::class, 'updateDataRequest']);
+        });
     });
 });

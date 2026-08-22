@@ -91,6 +91,13 @@ class HomeOpsReceiptScanController extends Controller
                 'updated_at' => now(),
             ]);
 
+            $this->recordSystemEvent($request, $userId, 'warning', 'receipt_scanner', 'extractor',
+                'Automatic receipt extraction fell back to manual review.', [
+                    'scan_id' => $scanId,
+                    'home_id' => $homeId,
+                    'exception' => class_basename($exception),
+                ]);
+
             return response()->json([
                 'ok' => true,
                 'scan' => [
@@ -232,19 +239,7 @@ class HomeOpsReceiptScanController extends Controller
                 $receiptId = DB::table('receipts')->insertGetId($receiptPayload);
 
                 foreach (array_values($data['line_items'] ?? []) as $index => $item) {
-                    DB::table('receipt_items')->insert([
-                        'receipt_id' => $receiptId,
-                        'line_order' => $index + 1,
-                        'item_name' => $item['description'],
-                        'quantity' => $item['quantity'] ?? null,
-                        'unit_price' => $item['unit_price'] ?? null,
-                        'line_total' => $item['line_total'] ?? null,
-                        'notes' => !empty($item['category_hint'])
-                            ? 'Category: '.$item['category_hint']
-                            : null,
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]);
+                    DB::table('receipt_items')->insert($this->receiptItemPayload($receiptId, $index, $item));
                 }
 
                 $this->linkLedgerToPeriods($userId, $homeId, $ledgerId, $date);
@@ -310,6 +305,55 @@ class HomeOpsReceiptScanController extends Controller
                 'Content-Disposition' => 'inline; filename="'.addslashes($receipt->file_name ?: 'receipt').'"',
             ],
         );
+    }
+
+    private function receiptItemPayload(int $receiptId, int $index, array $item): array
+    {
+        $payload = [
+            'receipt_id' => $receiptId,
+            'quantity' => $item['quantity'] ?? null,
+            'unit_price' => $item['unit_price'] ?? null,
+            'line_total' => $item['line_total'] ?? null,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ];
+
+        $categoryHint = !empty($item['category_hint']) ? (string) $item['category_hint'] : null;
+        $description = (string) ($item['description'] ?? '');
+
+        if (Schema::hasColumn('receipt_items', 'line_order')) $payload['line_order'] = $index + 1;
+        if (Schema::hasColumn('receipt_items', 'item_name')) $payload['item_name'] = $description;
+        if (Schema::hasColumn('receipt_items', 'notes')) $payload['notes'] = $categoryHint ? 'Category: '.$categoryHint : null;
+
+        // Legacy columns remain dual-written so installs that received the original receipt
+        // migration cannot reject new rows because description was created NOT NULL.
+        if (Schema::hasColumn('receipt_items', 'line_number')) $payload['line_number'] = $index + 1;
+        if (Schema::hasColumn('receipt_items', 'description')) $payload['description'] = $description;
+        if (Schema::hasColumn('receipt_items', 'category_hint')) $payload['category_hint'] = $categoryHint;
+
+        return $payload;
+    }
+
+    private function recordSystemEvent(Request $request, ?int $userId, string $severity, string $category, string $source, string $message, array $context = []): void
+    {
+        if (!Schema::hasTable('homeops_system_events')) return;
+
+        try {
+            DB::table('homeops_system_events')->insert([
+                'request_id' => $request->attributes->get('homeops_request_id'),
+                'user_id' => $userId,
+                'severity' => $severity,
+                'category' => $category,
+                'source' => $source,
+                'message' => Str::limit($message, 1000, ''),
+                'context' => empty($context) ? null : json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                'occurred_at' => now(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        } catch (\Throwable $loggingFailure) {
+            report($loggingFailure);
+        }
     }
 
     private function schemaReady(): bool

@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\User;
 use App\Support\HomeOpsV0;
+use App\Support\HomeOpsAdminAccess;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -25,6 +26,12 @@ class HomeOpsAuthController extends Controller
 
         if (!$user || !Hash::check($data['password'], $user->password)) {
             return response()->json(['message' => 'Invalid email or password.'], 422);
+        }
+
+        if (Schema::hasColumn('users', 'account_status') && ($user->account_status ?? 'active') !== 'active') {
+            return response()->json([
+                'message' => 'This HomeOps account is not currently active. Contact support if you need help.',
+            ], 403);
         }
 
         $token = $this->issueToken($request, $user, (bool) ($data['remember'] ?? true));
@@ -194,6 +201,9 @@ class HomeOpsAuthController extends Controller
             'id' => (int) $user->id,
             'name' => $user->name,
             'email' => $user->email,
+            'is_admin' => HomeOpsAdminAccess::isAdmin($user),
+            'account_status' => Schema::hasColumn('users', 'account_status') ? ($user->account_status ?: 'active') : 'active',
+            'plan_key' => Schema::hasColumn('users', 'plan_key') ? ($user->plan_key ?: 'core') : 'core',
         ];
     }
 }

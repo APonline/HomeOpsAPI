@@ -34,23 +34,28 @@ class HomeOpsRecordsController extends Controller
             'ledger_entries.title as ledger_title',
         ]);
         $receiptIds = $rows->pluck('id')->map(fn ($id) => (int) $id)->all();
-        $itemsByReceipt = Schema::hasTable('receipt_items') && $receiptIds
-            ? DB::table('receipt_items')->whereIn('receipt_id', $receiptIds)
-                ->orderBy('line_order')
+        $itemsByReceipt = collect();
+        if (Schema::hasTable('receipt_items') && $receiptIds) {
+            $lineColumn = Schema::hasColumn('receipt_items', 'line_order') ? 'line_order' : 'line_number';
+            $nameColumn = Schema::hasColumn('receipt_items', 'item_name') ? 'item_name' : 'description';
+            $notesColumn = Schema::hasColumn('receipt_items', 'notes') ? 'notes' : 'category_hint';
+
+            $itemsByReceipt = DB::table('receipt_items')->whereIn('receipt_id', $receiptIds)
+                ->orderBy($lineColumn)
                 ->get([
                     'id',
                     'receipt_id',
-                    'line_order as line_number',
-                    'item_name as description',
+                    $lineColumn.' as line_number',
+                    $nameColumn.' as description',
                     'quantity',
                     'unit_price',
                     'line_total',
-                    'notes as category_hint',
+                    $notesColumn.' as category_hint',
                     'created_at',
                     'updated_at',
                 ])
-                ->groupBy('receipt_id')
-            : collect();
+                ->groupBy('receipt_id');
+        }
 
         $receipts = $rows->map(function ($receipt) use ($itemsByReceipt) {
             $items = collect($itemsByReceipt->get($receipt->id, []))->map(fn ($item) => [
@@ -167,19 +172,7 @@ class HomeOpsRecordsController extends Controller
             if (Schema::hasTable('receipt_items') && array_key_exists('line_items', $data)) {
                 DB::table('receipt_items')->where('receipt_id', $receiptId)->delete();
                 foreach (array_values($data['line_items'] ?? []) as $index => $item) {
-                    DB::table('receipt_items')->insert([
-                        'receipt_id' => $receiptId,
-                        'line_order' => $index + 1,
-                        'item_name' => $item['description'],
-                        'quantity' => $item['quantity'] ?? null,
-                        'unit_price' => $item['unit_price'] ?? null,
-                        'line_total' => $item['line_total'] ?? null,
-                        'notes' => !empty($item['category_hint'])
-                            ? 'Category: '.$item['category_hint']
-                            : null,
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]);
+                    DB::table('receipt_items')->insert($this->receiptItemPayload($receiptId, $index, $item));
                 }
             }
 
@@ -495,4 +488,28 @@ class HomeOpsRecordsController extends Controller
             ]);
         }
     }
+
+    private function receiptItemPayload(int $receiptId, int $index, array $item): array
+    {
+        $payload = [
+            'receipt_id' => $receiptId,
+            'quantity' => $item['quantity'] ?? null,
+            'unit_price' => $item['unit_price'] ?? null,
+            'line_total' => $item['line_total'] ?? null,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ];
+
+        $description = (string) ($item['description'] ?? '');
+        $categoryHint = !empty($item['category_hint']) ? (string) $item['category_hint'] : null;
+        if (Schema::hasColumn('receipt_items', 'line_order')) $payload['line_order'] = $index + 1;
+        if (Schema::hasColumn('receipt_items', 'item_name')) $payload['item_name'] = $description;
+        if (Schema::hasColumn('receipt_items', 'notes')) $payload['notes'] = $categoryHint ? 'Category: '.$categoryHint : null;
+        if (Schema::hasColumn('receipt_items', 'line_number')) $payload['line_number'] = $index + 1;
+        if (Schema::hasColumn('receipt_items', 'description')) $payload['description'] = $description;
+        if (Schema::hasColumn('receipt_items', 'category_hint')) $payload['category_hint'] = $categoryHint;
+
+        return $payload;
+    }
+
 }
