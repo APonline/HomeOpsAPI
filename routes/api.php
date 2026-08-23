@@ -19,6 +19,7 @@ use App\Http\Controllers\HomeOpsFeatureController;
 use App\Http\Middleware\HomeOpsTokenAuth;
 use App\Http\Middleware\HomeOpsAdminAuth;
 use App\Http\Middleware\HomeOpsRequestAudit;
+use App\Http\Controllers\HomeOpsPlaidController;
 
 Route::prefix('homeops')->group(function () {
     // Public auth attempts are still request-audited (credentials are redacted by middleware).
@@ -121,6 +122,11 @@ Route::prefix('homeops')->group(function () {
         Route::post('/financial-accounts', [HomeOpsV1Controller::class, 'storeFinancialAccount'])->middleware('homeops.feature:financing');
         Route::patch('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'updateFinancialAccount'])->middleware('homeops.feature:financing');
         Route::delete('/financial-accounts/{accountId}', [HomeOpsV1Controller::class, 'deleteFinancialAccount'])->middleware('homeops.feature:financing');
+
+        Route::post('/plaid/link-token', [HomeOpsPlaidController::class, 'linkToken'])->middleware('homeops.feature:financing');
+        Route::post('/plaid/exchange', [HomeOpsPlaidController::class, 'exchange'])->middleware('homeops.feature:financing');
+        Route::post('/plaid/refresh-balances', [HomeOpsPlaidController::class, 'refreshBalances'])->middleware('homeops.feature:financing');
+        Route::post('/plaid/update-link-token', [HomeOpsPlaidController::class, 'updateLinkToken'])->middleware('homeops.feature:financing');
 
         Route::get('/documents', [HomeOpsV1Controller::class, 'documents'])->middleware('homeops.feature:documents');
         Route::post('/documents', [HomeOpsV1Controller::class, 'storeDocument'])->middleware('homeops.feature:documents');
