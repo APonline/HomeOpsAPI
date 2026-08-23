@@ -20,6 +20,9 @@ use App\Http\Middleware\HomeOpsTokenAuth;
 use App\Http\Middleware\HomeOpsAdminAuth;
 use App\Http\Middleware\HomeOpsRequestAudit;
 use App\Http\Controllers\HomeOpsPlaidController;
+use App\Http\Controllers\HomeOpsGroceryInventoryController;
+use App\Http\Controllers\HomeOpsAttentionController;
+use App\Http\Controllers\HomeOpsGroceryRecipeController;
 
 Route::prefix('homeops')->group(function () {
     // Public auth attempts are still request-audited (credentials are redacted by middleware).
@@ -67,6 +70,7 @@ Route::prefix('homeops')->group(function () {
         Route::post('/properties/{homeId}/core-bills/sync', [HomeOpsCoreBillsController::class, 'sync']);
 
         Route::get('/dashboard', [HomeOpsDashboardController::class, 'index']);
+        Route::get('/attention', [HomeOpsAttentionController::class, 'index']);
         Route::get('/v0/status', [HomeOpsV0StatusController::class, 'show']);
 
         Route::get('/budget-profile', [HomeOpsBudgetController::class, 'show']);
@@ -103,6 +107,23 @@ Route::prefix('homeops')->group(function () {
         Route::post('/spending-periods', [HomeOpsWriteController::class, 'storePeriod']);
         Route::patch('/spending-periods/{periodId}', [HomeOpsRecordsController::class, 'updatePeriod']);
         Route::delete('/spending-periods/{periodId}', [HomeOpsRecordsController::class, 'deletePeriod']);
+
+        Route::get('/grocery-inventory', [HomeOpsGroceryInventoryController::class, 'index']);
+        Route::post('/grocery-inventory', [HomeOpsGroceryInventoryController::class, 'store']);
+        Route::post('/grocery-inventory/starter', [HomeOpsGroceryInventoryController::class, 'starter']);
+        Route::patch('/grocery-inventory/{slotId}', [HomeOpsGroceryInventoryController::class, 'update']);
+        Route::patch('/grocery-inventory/{slotId}/state', [HomeOpsGroceryInventoryController::class, 'updateState']);
+        Route::patch('/grocery-inventory/{slotId}/shopping', [HomeOpsGroceryInventoryController::class, 'toggleShopping']);
+        Route::post('/grocery-inventory/{slotId}/equip-replacement', [HomeOpsGroceryInventoryController::class, 'equipReplacement']);
+        Route::delete('/grocery-inventory/{slotId}', [HomeOpsGroceryInventoryController::class, 'destroy']);
+
+        Route::get('/grocery-recipes', [HomeOpsGroceryRecipeController::class, 'index']);
+        Route::post('/grocery-recipes', [HomeOpsGroceryRecipeController::class, 'store']);
+        Route::patch('/grocery-recipes/{recipeId}', [HomeOpsGroceryRecipeController::class, 'update']);
+        Route::post('/grocery-recipes/{recipeId}/shopping', [HomeOpsGroceryRecipeController::class, 'addMissingToShopping']);
+        Route::post('/grocery-recipes/{recipeId}/cook', [HomeOpsGroceryRecipeController::class, 'cook']);
+        Route::delete('/grocery-recipes/{recipeId}', [HomeOpsGroceryRecipeController::class, 'destroy']);
+
 
         Route::get('/maintenance-items', [HomeOpsReadController::class, 'maintenanceItems']);
         Route::post('/maintenance-items', [HomeOpsWriteController::class, 'storeMaintenanceItem']);
